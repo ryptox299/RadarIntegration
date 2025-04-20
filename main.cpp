@@ -10,14 +10,14 @@
 #include "dji_linux_helpers.hpp"
 #include <limits> // For numeric limits
 #include <fstream> // For file reading AND LOGGING
-#include <cmath> // For std::abs, std::isnan
+#include <cmath> // For std::abs, std::isnan, std::cos, std::fabs
 #include <atomic> // For thread-safe stop flag
 #include <cstring> // For strchr, strncpy
 #include <stdexcept> // For standard exceptions
 #include <array> // For std::array used in read_some buffer
 #include <ctime>  // For checking polling timestamp
 #include <streambuf> // For TeeBuf
-#include <mutex>     // For TeeBuf thread safety
+#include <mutex>     // For TeeBuf thread safety AND GLOBAL DATA
 #include <memory>    // For unique_ptr
 #include <iomanip>   // For std::put_time in timestamp, std::setw, std::left
 #include <algorithm> // For std::transform
@@ -49,6 +49,8 @@
 #include "imgui.h"
 #include "imgui_impl_sdl2.h"
 #include "imgui_impl_opengl3.h"
+// Add internal header for font size access if needed, though GetFontSize should work
+#include "imgui_internal.h"
 
 
 // Define M_PI if not already defined (likely in cmath)
@@ -59,6 +61,30 @@
 using namespace DJI::OSDK;
 using json = nlohmann::json;
 using boost::asio::ip::tcp;
+
+
+// --- Radar Object Definition ---
+struct RadarObject {
+    std::string timestamp;
+    std::string sensor;
+    std::string src;
+    float X, Y, Z;
+    float Xdir, Ydir, Zdir;
+    float Range, RangeRate, Pwr, Az, El;
+    std::string ID;
+    float Xsize, Ysize, Zsize;
+    float Conf;
+};
+// --- End Radar Object Definition ---
+
+
+// --- Global Data for GUI ---
+std::vector<RadarObject> g_beaconObjects;
+std::mutex               g_beaconMutex;
+std::vector<RadarObject> g_anonObjects;
+std::mutex               g_anonMutex;
+// --- End Global Data ---
+
 
 // --- Logging Setup ---
 // (TeeBuf and LogRedirector classes remain exactly the same as before)
@@ -184,17 +210,37 @@ private:
 
 
 // --- Configurable Parameters (with defaults relevant to W and E) ---
-std::string TARGET_BEACON_ID = "BEACON-TX-ID:00005555";
-float targetDistance = 8.0f;        // Target distance from the wall (meters) - Used by W
-float targetAzimuth = 0.0f;         // *Initial* target azimuth relative to the beacon (degrees) - Used by W
-// Forward Control (X-velocity) - Used by W
+std::string TARGET_BEACON_ID = "BEACON-TX-ID:00005555"; // Still used for control logic target
+float targetDistance = 8.0f;        // Target HORIZONTAL distance from the wall (meters)
+float targetAzimuth = 0.0f;         // *Initial* target azimuth relative to the beacon (degrees)
+float radarMountAngleDegrees = 45.0f; // Radar mounting angle (degrees, relative to horizontal)
+// Forward Control (X-velocity)
 float Kp_forward = 0.5;             // Proportional gain for forward movement
 float max_forward_speed = 0.8;      // Max speed towards/away from the wall
 float forward_dead_zone = 0.2;      // Dead zone for forward movement (meters)
-// Lateral Control (Y-velocity) - Used by W
+// Lateral Control (Y-velocity)
 float Kp_lateral = 0.02;            // Proportional gain for lateral movement
 float max_lateral_speed = 0.5;      // Max speed sideways
 float azimuth_dead_zone = 1.5;      // Dead zone for *initial* lateral movement (degrees)
+bool invertLateralControl = false;  // Flag to invert lateral control based on beacon azimuth
+// Yaw Control
+float Kp_yaw = 0.01;                // Proportional gain for yaw rate based on azimuth balance
+float max_yaw_rate = 10.0;          // Max yaw rate (degrees/second)
+float yaw_azimuth_balance_dead_zone = 1.0; // Dead zone for yaw control based on sum of avg pos/neg azimuth (degrees)
+bool invertYawControl = false;      // Flag to invert yaw control direction
+// Sensor Selection (Independent Sets)
+// For Wall Distance Calculation
+bool useWallSensorRAz = true;       // Use "R_Az" sensor data for wall distance
+bool useWallSensorREl = true;       // Use "R_El" sensor data for wall distance
+bool useWallSensorRAzREl = true;    // Use "R_Az_R_El" sensor data for wall distance
+// For Beacon Azimuth Detection
+bool useBeaconSensorRAz = true;     // Use "R_Az" sensor data for beacon azimuth
+bool useBeaconSensorREl = true;     // Use "R_El" sensor data for beacon azimuth
+bool useBeaconSensorRAzREl = true;  // Use "R_Az_R_El" sensor data for beacon azimuth
+// For Yaw Control Calculation
+bool useYawSensorRAz = true;        // Use "R_Az" sensor data for yaw control
+bool useYawSensorREl = true;        // Use "R_El" sensor data for yaw control
+bool useYawSensorRAzREl = true;     // Use "R_Az_R_El" sensor data for yaw control
 // Bridge Reconnection Parameter
 bool enable_bridge_reconnection = false; // Default to false
 // NEW PARAMETER for Drone Connection
@@ -204,13 +250,17 @@ bool connect_to_drone = true;       // Default to true (attempt connection)
 
 // Persistent variables for tracking the current second and wall/beacon candidate data (relevant to W and E)
 std::string currentSecond = "";
-// General Wall/Beacon Data (Used by W)
-float lowestRange = std::numeric_limits<float>::max(); // Closest wall candidate range (any sensor) - Used by 'w'
-bool hasAnonData = false;                              // Flag if any anon data seen this second - Used by 'w'
-float targetBeaconAzimuth = std::numeric_limits<float>::quiet_NaN(); // Sensed beacon azimuth - Used by 'w'
-bool foundTargetBeacon = false;                        // Flag if target beacon seen this second - Used by 'w'
-// REMOVED Specific Data for Yaw Lock, Combined, R_El Modes
-// REMOVED Vertical Cycle State
+// General Wall/Beacon Data (Used by wall+beacon modes)
+float lowestRange = std::numeric_limits<float>::max(); // Closest wall candidate DIRECT range (from selected wall sensors)
+bool hasAnonData = false;                              // Flag if any *selected wall* anon data seen this second
+float targetBeaconAzimuth = std::numeric_limits<float>::quiet_NaN(); // Sensed beacon azimuth (from selected beacon sensors)
+bool foundTargetBeacon = false;                        // Flag if target beacon seen this second (from selected beacon sensors)
+// Data for Yaw Control (Used by wall+beacon+yaw mode)
+float sumPositiveAz = 0.0f;
+int countPositiveAz = 0;
+float sumNegativeAz = 0.0f;
+int countNegativeAz = 0;
+bool hasYawAnonData = false;                           // Flag if any *selected yaw* anon data seen this second
 
 
 // Global variable for default Python bridge script (Hardcoded)
@@ -235,6 +285,21 @@ enum class BridgeConnectionStatus {
 };
 std::atomic<BridgeConnectionStatus> currentBridgeStatus(BridgeConnectionStatus::DISCONNECTED); // Global atomic variable
 // --- End NEW ---
+
+// Helper function to parse boolean string
+bool parseBool(const std::string& value, bool defaultValue) {
+    std::string lower_value = value;
+    std::transform(lower_value.begin(), lower_value.end(), lower_value.begin(), ::tolower);
+    if (lower_value == "true" || lower_value == "1") {
+        return true;
+    } else if (lower_value == "false" || lower_value == "0") {
+        return false;
+    } else {
+        std::cerr << "Warning: Invalid boolean value: '" << value << "'. Using default (" << std::boolalpha << defaultValue << ")." << std::endl;
+        return defaultValue;
+    }
+}
+
 
 // Function to load preferences (Simplified)
 void loadPreferences() {
@@ -269,6 +334,9 @@ void loadPreferences() {
                 } else if (key == "target_azimuth") {
                     targetAzimuth = std::stof(value);
                     std::cout << "  targetAzimuth (Initial) set to: " << targetAzimuth << " degrees (from preferences file)" << std::endl; // Logged
+                } else if (key == "radar_mount_angle_degrees") {
+                    radarMountAngleDegrees = std::stof(value);
+                    std::cout << "  radarMountAngleDegrees set to: " << radarMountAngleDegrees << " degrees (from preferences file)" << std::endl; // Logged
                 } else if (key == "kp_forward") {
                     Kp_forward = std::stof(value);
                     std::cout << "  Kp_forward set to: " << Kp_forward << " (from preferences file)" << std::endl; // Logged
@@ -287,29 +355,58 @@ void loadPreferences() {
                 } else if (key == "azimuth_dead_zone") {
                     azimuth_dead_zone = std::stof(value);
                     std::cout << "  azimuth_dead_zone set to: " << azimuth_dead_zone << " degrees (from preferences file)" << std::endl; // Logged
+                } else if (key == "invert_lateral_control") {
+                    invertLateralControl = parseBool(value, invertLateralControl); // Use helper
+                    std::cout << "  invertLateralControl set to: " << std::boolalpha << invertLateralControl << " (from preferences file)" << std::endl; // Logged
+                // Yaw Control Keys
+                } else if (key == "kp_yaw") {
+                    Kp_yaw = std::stof(value);
+                    std::cout << "  Kp_yaw set to: " << Kp_yaw << " (from preferences file)" << std::endl;
+                } else if (key == "max_yaw_rate") {
+                    max_yaw_rate = std::stof(value);
+                    std::cout << "  max_yaw_rate set to: " << max_yaw_rate << " deg/s (from preferences file)" << std::endl;
+                } else if (key == "yaw_azimuth_balance_dead_zone") {
+                    yaw_azimuth_balance_dead_zone = std::stof(value);
+                    std::cout << "  yaw_azimuth_balance_dead_zone set to: " << yaw_azimuth_balance_dead_zone << " degrees (from preferences file)" << std::endl;
+                } else if (key == "invert_yaw_control") {
+                    invertYawControl = parseBool(value, invertYawControl);
+                    std::cout << "  invertYawControl set to: " << std::boolalpha << invertYawControl << " (from preferences file)" << std::endl;
+                // Wall Sensor Keys
+                } else if (key == "use_wall_sensor_r_az") {
+                    useWallSensorRAz = parseBool(value, useWallSensorRAz);
+                    std::cout << "  useWallSensorRAz set to: " << std::boolalpha << useWallSensorRAz << " (from preferences file)" << std::endl; // Logged
+                } else if (key == "use_wall_sensor_r_el") {
+                    useWallSensorREl = parseBool(value, useWallSensorREl);
+                    std::cout << "  useWallSensorREl set to: " << std::boolalpha << useWallSensorREl << " (from preferences file)" << std::endl; // Logged
+                } else if (key == "use_wall_sensor_r_az_r_el") {
+                    useWallSensorRAzREl = parseBool(value, useWallSensorRAzREl);
+                    std::cout << "  useWallSensorRAzREl set to: " << std::boolalpha << useWallSensorRAzREl << " (from preferences file)" << std::endl; // Logged
+                // Beacon Sensor Keys
+                } else if (key == "use_beacon_sensor_r_az") {
+                    useBeaconSensorRAz = parseBool(value, useBeaconSensorRAz);
+                    std::cout << "  useBeaconSensorRAz set to: " << std::boolalpha << useBeaconSensorRAz << " (from preferences file)" << std::endl; // Logged
+                } else if (key == "use_beacon_sensor_r_el") {
+                    useBeaconSensorREl = parseBool(value, useBeaconSensorREl);
+                    std::cout << "  useBeaconSensorREl set to: " << std::boolalpha << useBeaconSensorREl << " (from preferences file)" << std::endl; // Logged
+                } else if (key == "use_beacon_sensor_r_az_r_el") {
+                    useBeaconSensorRAzREl = parseBool(value, useBeaconSensorRAzREl);
+                    std::cout << "  useBeaconSensorRAzREl set to: " << std::boolalpha << useBeaconSensorRAzREl << " (from preferences file)" << std::endl; // Logged
+                // Yaw Sensor Keys
+                } else if (key == "use_yaw_sensor_r_az") {
+                    useYawSensorRAz = parseBool(value, useYawSensorRAz);
+                    std::cout << "  useYawSensorRAz set to: " << std::boolalpha << useYawSensorRAz << " (from preferences file)" << std::endl;
+                } else if (key == "use_yaw_sensor_r_el") {
+                    useYawSensorREl = parseBool(value, useYawSensorREl);
+                    std::cout << "  useYawSensorREl set to: " << std::boolalpha << useYawSensorREl << " (from preferences file)" << std::endl;
+                } else if (key == "use_yaw_sensor_r_az_r_el") {
+                    useYawSensorRAzREl = parseBool(value, useYawSensorRAzREl);
+                    std::cout << "  useYawSensorRAzREl set to: " << std::boolalpha << useYawSensorRAzREl << " (from preferences file)" << std::endl;
+                // --- End NEW ---
                 } else if (key == "enable_bridge_reconnection") {
-                    std::string lower_value = value;
-                    std::transform(lower_value.begin(), lower_value.end(), lower_value.begin(), ::tolower);
-                    if (lower_value == "true" || lower_value == "1") {
-                        enable_bridge_reconnection = true;
-                    } else if (lower_value == "false" || lower_value == "0") {
-                        enable_bridge_reconnection = false;
-                    } else {
-                        std::cerr << "Warning: Invalid boolean value for 'enable_bridge_reconnection': " << value << ". Using default (false)." << std::endl;
-                        enable_bridge_reconnection = false; // Default
-                    }
+                    enable_bridge_reconnection = parseBool(value, enable_bridge_reconnection);
                     std::cout << "  enable_bridge_reconnection set to: " << std::boolalpha << enable_bridge_reconnection << " (from preferences file)" << std::endl; // Logged
-                } else if (key == "connect_to_drone") { // NEW PARAMETER
-                    std::string lower_value = value;
-                    std::transform(lower_value.begin(), lower_value.end(), lower_value.begin(), ::tolower);
-                    if (lower_value == "true" || lower_value == "1") {
-                        connect_to_drone = true;
-                    } else if (lower_value == "false" || lower_value == "0") {
-                        connect_to_drone = false;
-                    } else {
-                        std::cerr << "Warning: Invalid boolean value for 'connect_to_drone': " << value << ". Using default (true)." << std::endl;
-                        connect_to_drone = true; // Default
-                    }
+                } else if (key == "connect_to_drone") {
+                    connect_to_drone = parseBool(value, connect_to_drone);
                     std::cout << "  connect_to_drone set to: " << std::boolalpha << connect_to_drone << " (from preferences file)" << std::endl; // Logged
                 }
                  else {
@@ -332,28 +429,37 @@ void loadPreferences() {
         std::cout << "  Default TARGET_BEACON_ID: " << TARGET_BEACON_ID << std::endl; // Logged
         std::cout << "  Default targetDistance: " << targetDistance << " meters" << std::endl; // Logged
         std::cout << "  Default targetAzimuth (Initial): " << targetAzimuth << " degrees" << std::endl; // Logged
+        std::cout << "  Default radarMountAngleDegrees: " << radarMountAngleDegrees << " degrees" << std::endl; // Logged default
         std::cout << "  Default Kp_forward: " << Kp_forward << std::endl; // Logged
         std::cout << "  Default max_forward_speed: " << max_forward_speed << " m/s" << std::endl; // Logged
         std::cout << "  Default forward_dead_zone: " << forward_dead_zone << " meters" << std::endl; // Logged
         std::cout << "  Default Kp_lateral: " << Kp_lateral << std::endl; // Logged
         std::cout << "  Default max_lateral_speed: " << max_lateral_speed << " m/s" << std::endl; // Logged
         std::cout << "  Default azimuth_dead_zone: " << azimuth_dead_zone << " degrees" << std::endl; // Logged
+        std::cout << "  Default invertLateralControl: " << std::boolalpha << invertLateralControl << std::endl; // Logged default
+        // Yaw Control Defaults
+        std::cout << "  Default Kp_yaw: " << Kp_yaw << std::endl;
+        std::cout << "  Default max_yaw_rate: " << max_yaw_rate << " deg/s" << std::endl;
+        std::cout << "  Default yaw_azimuth_balance_dead_zone: " << yaw_azimuth_balance_dead_zone << " degrees" << std::endl;
+        std::cout << "  Default invertYawControl: " << std::boolalpha << invertYawControl << std::endl;
+        // Wall Sensor Defaults
+        std::cout << "  Default useWallSensorRAz: " << std::boolalpha << useWallSensorRAz << std::endl;
+        std::cout << "  Default useWallSensorREl: " << std::boolalpha << useWallSensorREl << std::endl;
+        std::cout << "  Default useWallSensorRAzREl: " << std::boolalpha << useWallSensorRAzREl << std::endl;
+        // Beacon Sensor Defaults
+        std::cout << "  Default useBeaconSensorRAz: " << std::boolalpha << useBeaconSensorRAz << std::endl;
+        std::cout << "  Default useBeaconSensorREl: " << std::boolalpha << useBeaconSensorREl << std::endl;
+        std::cout << "  Default useBeaconSensorRAzREl: " << std::boolalpha << useBeaconSensorRAzREl << std::endl;
+        // Yaw Sensor Defaults
+        std::cout << "  Default useYawSensorRAz: " << std::boolalpha << useYawSensorRAz << std::endl;
+        std::cout << "  Default useYawSensorREl: " << std::boolalpha << useYawSensorREl << std::endl;
+        std::cout << "  Default useYawSensorRAzREl: " << std::boolalpha << useYawSensorRAzREl << std::endl;
+        // --- End NEW ---
         std::cout << "  Default enable_bridge_reconnection: " << std::boolalpha << enable_bridge_reconnection << std::endl; // Logged default
         std::cout << "  Default connect_to_drone: " << std::boolalpha << connect_to_drone << std::endl; // Logged default
     }
 }
 
-struct RadarObject {
-    std::string timestamp;
-    std::string sensor;
-    std::string src;
-    float X, Y, Z;
-    float Xdir, Ydir, Zdir;
-    float Range, RangeRate, Pwr, Az, El;
-    std::string ID;
-    float Xsize, Ysize, Zsize;
-    float Conf;
-};
 
 // Display full radar object details (Needed for 'e' and debug in 'w')
 void displayRadarObjects(const std::vector<RadarObject>& objects) {
@@ -380,69 +486,113 @@ void displayRadarObjects(const std::vector<RadarObject>& objects) {
 
 // --- REMOVED displayRadarObjectsMinimal ---
 
-// --- FUNCTION FOR [w] --- // ADDED FULL LOGGING & REVERSED LATERAL
+// Helper lambda to create sensor string for logging
+auto getSensorString = [](bool useAz, bool useEl, bool useAzEl) -> std::string {
+    std::string usedSensorsStr = "";
+    if (useAz) usedSensorsStr += "R_Az ";
+    if (useEl) usedSensorsStr += "R_El ";
+    if (useAzEl) usedSensorsStr += "R_Az_R_El";
+    if (usedSensorsStr.empty()) usedSensorsStr = "NONE";
+    // Remove trailing space if any
+    if (!usedSensorsStr.empty() && usedSensorsStr.back() == ' ') {
+        usedSensorsStr.pop_back();
+    }
+    return usedSensorsStr;
+};
+
+// --- FUNCTION FOR [w] --- // (Original Wall+Beacon Following)
 void extractBeaconAndWallData(const std::vector<RadarObject>& objects, Vehicle* vehicle, bool enableControl) {
     for (const auto& obj : objects) {
          if (stopProcessingFlag.load()) return;
         std::string ts_cleaned = obj.timestamp;
-        if (!ts_cleaned.empty() && ts_cleaned.front() == '"') ts_cleaned.erase(0, 1);
-        if (!ts_cleaned.empty() && ts_cleaned.back() == '"') ts_cleaned.pop_back();
+        // Timestamp cleaning already done in parseRadarData
         std::string objSecond;
         size_t dotPos = ts_cleaned.find('.');
         objSecond = (dotPos != std::string::npos) ? ts_cleaned.substr(0, dotPos) : ts_cleaned;
         if (!currentSecond.empty() && objSecond < currentSecond) {
-            continue;
+            continue; // Skip objects from a previous second
         }
-        if (objSecond != currentSecond) {
+        if (objSecond != currentSecond) { // New second detected
+            // Process control logic for the *previous* second if data was available
             if (!currentSecond.empty() && (hasAnonData || foundTargetBeacon)) {
 
-                // --- ADDED FULL LOGGING ---
-                // displayRadarObjects(objects); // Displaying *incoming* objects for the *new* second is confusing here. Better to log state below.
-                // --- END ADDED FULL LOGGING ---
+                // Get sensor strings for logging based on current settings
+                std::string wallSensorLogStr = getSensorString(useWallSensorRAz, useWallSensorREl, useWallSensorRAzREl);
+                std::string beaconSensorLogStr = getSensorString(useBeaconSensorRAz, useBeaconSensorREl, useBeaconSensorRAzREl);
 
                 if (enableControl && vehicle != nullptr && vehicle->control != nullptr) {
                     float velocity_x = 0.0f;
-                    if (hasAnonData) { // Use overall closest anon range for 'w' mode
-                        float difference = lowestRange - targetDistance; // Uses the CURRENT targetDistance
+                    float actualHorizontalDistance = std::numeric_limits<float>::quiet_NaN(); // Initialize to NaN
+
+                    // --- Calculate horizontal distance using radar angle & selected wall sensors ---
+                    if (hasAnonData && lowestRange != std::numeric_limits<float>::max()) { // hasAnonData is based on selected wall sensors
+                        // Convert mount angle to radians
+                        float angleRadians = radarMountAngleDegrees * M_PI / 180.0;
+                        // Calculate horizontal distance D = R * cos(theta)
+                        actualHorizontalDistance = lowestRange * std::cos(angleRadians);
+
+                        // Calculate difference based on horizontal distance
+                        float difference = actualHorizontalDistance - targetDistance; // Uses the CURRENT targetDistance
                         if (std::abs(difference) > forward_dead_zone) { // Uses the CURRENT forward_dead_zone
                             velocity_x = std::max(-max_forward_speed, std::min(Kp_forward * difference, max_forward_speed)); // Uses CURRENT Kp_forward, max_forward_speed
                         }
                     }
+
                     float velocity_y = 0.0f;
-                    if (foundTargetBeacon && !std::isnan(targetBeaconAzimuth)) { // Use beacon azimuth for 'w' mode lateral control
+                    if (foundTargetBeacon && !std::isnan(targetBeaconAzimuth)) { // foundTargetBeacon is based on selected beacon sensors
                         float azimuth_error = targetBeaconAzimuth - targetAzimuth; // Uses the CURRENT targetAzimuth
                         if (std::abs(azimuth_error) > azimuth_dead_zone) { // Uses the CURRENT azimuth_dead_zone
-                            // REVERSED LATERAL CALCULATION
-                            velocity_y = std::max(-max_lateral_speed, std::min(-Kp_lateral * azimuth_error, max_lateral_speed)); // Uses CURRENT Kp_lateral, max_lateral_speed
+                            // Invert lateral control based on flag
+                            float lateral_gain = invertLateralControl ? Kp_lateral : -Kp_lateral;
+                            velocity_y = std::max(-max_lateral_speed, std::min(lateral_gain * azimuth_error, max_lateral_speed)); // Uses CURRENT Kp_lateral (sign adjusted), max_lateral_speed
                         }
-                    } else if (!foundTargetBeacon) {
-                        std::cout << "***BEACON NOT FOUND***" << std::endl; // Log beacon loss if relevant
+                    } else if (!foundTargetBeacon && enableControl) { // Only log beacon not found if control is active
+                        std::cout << "*** TARGET BEACON ID '" << TARGET_BEACON_ID << "' NOT FOUND FROM SENSORS [" << beaconSensorLogStr << "] ***" << std::endl; // Log beacon loss if relevant
                     }
                     uint8_t controlFlag = DJI::OSDK::Control::HORIZONTAL_VELOCITY | DJI::OSDK::Control::VERTICAL_VELOCITY |
                                           DJI::OSDK::Control::YAW_RATE | DJI::OSDK::Control::HORIZONTAL_BODY |
                                           DJI::OSDK::Control::STABLE_ENABLE;
-                    DJI::OSDK::Control::CtrlData ctrlData(controlFlag, velocity_x, velocity_y, 0, 0); // Z vel and Yaw rate are 0
+                    // Yaw rate is explicitly 0 for this mode
+                    DJI::OSDK::Control::CtrlData ctrlData(controlFlag, velocity_x, velocity_y, 0, 0);
 
-                    // --- Mode-Specific LOGGING ('w') ---
-                    std::cout << "[Wall Follow] Control Status (Second: " << currentSecond << "):\n" // Log which second this applies to
-                              << "  TargetWall  = " << std::fixed << std::setprecision(1) << std::setw(3) << targetDistance << "\n"
-                              << "  CurrentWall = " << (hasAnonData ? std::to_string(lowestRange) : "N/A") << "\n"
-                              << "  TargetBeaconAz=" << targetAzimuth << "\n" // Added Target Beacon Az
-                              << "  CurrentBeaconAz=" << (foundTargetBeacon && !std::isnan(targetBeaconAzimuth) ? std::to_string(targetBeaconAzimuth) : "N/A") << "\n"
+                    // --- Mode-Specific LOGGING ('w') - UPDATED ---
+                    std::cout << "[Wall+Beacon Follow] Control Status (Second: " << currentSecond << "):\n" // Log which second this applies to
+                              << "  TargetHorizDist = " << std::fixed << std::setprecision(1) << std::setw(3) << targetDistance << "\n"
+                              << "  RadarAngle      = " << std::fixed << std::setprecision(1) << std::setw(3) << radarMountAngleDegrees << "\n"
+                              << "  Wall Sensors    = " << wallSensorLogStr << "\n"
+                              << "  MeasuredRange   = " << (hasAnonData && lowestRange != std::numeric_limits<float>::max() ? std::to_string(lowestRange) : "N/A") << "\n"
+                              << "  CalculatedDist  = " << (!std::isnan(actualHorizontalDistance) ? std::to_string(actualHorizontalDistance) : "N/A") << "\n"
+                              << "  Beacon Sensors  = " << beaconSensorLogStr << "\n"
+                              << "  TargetBeaconAz  = " << targetAzimuth << "\n"
+                              << "  CurrentBeaconAz = " << (foundTargetBeacon && !std::isnan(targetBeaconAzimuth) ? std::to_string(targetBeaconAzimuth) : "N/A") << "\n"
+                              << "  LateralInverted = " << std::boolalpha << invertLateralControl << "\n"
                               << "\n"
-                              << "  Computed Velocity(X=" << velocity_x << ", Y=" << velocity_y << ")" << std::endl;
+                              << "  Computed Velocity(X=" << velocity_x << ", Y=" << velocity_y << ", YawRate=0)" << std::endl; // Explicitly show YawRate=0
                     std::cout << "--------------------------------------" << std::endl; // Logged
                     // --- END Mode-Specific LOGGING ---
 
                     vehicle->control->flightCtrl(ctrlData);
                 } else if (hasAnonData || foundTargetBeacon) { // Only log if there's relevant data when control disabled
-                     if (!foundTargetBeacon) { std::cout << "***BEACON NOT FOUND***" << std::endl;} // Log beacon loss
-                     // --- Mode-Specific LOGGING ('w' - No Control) ---
-                     std::cout << "[Wall Follow] (Flight Control Disabled or Not Available) (Second: " << currentSecond << "):\n" // Log which second
-                               << "  TargetWall  = " << std::fixed << std::setprecision(1) << std::setw(3) << targetDistance << "\n"
-                               << "  CurrentWall = " << (hasAnonData ? std::to_string(lowestRange) : "N/A") << "\n"
-                               << "  TargetBeaconAz=" << targetAzimuth << "\n" // Added Target Beacon Az
-                               << "  CurrentBeaconAz=" << (foundTargetBeacon && !std::isnan(targetBeaconAzimuth) ? std::to_string(targetBeaconAzimuth) : "N/A")
+                    float actualHorizontalDistance = std::numeric_limits<float>::quiet_NaN();
+                     if (hasAnonData && lowestRange != std::numeric_limits<float>::max()) {
+                        float angleRadians = radarMountAngleDegrees * M_PI / 180.0;
+                        actualHorizontalDistance = lowestRange * std::cos(angleRadians);
+                     }
+                     if (!foundTargetBeacon) {
+                         std::cout << "*** TARGET BEACON ID '" << TARGET_BEACON_ID << "' NOT FOUND FROM SENSORS [" << beaconSensorLogStr << "] ***" << std::endl; // Log beacon loss
+                     }
+
+                     // --- Mode-Specific LOGGING ('w' - No Control) - UPDATED ---
+                     std::cout << "[Wall+Beacon Follow] (Flight Control Disabled or Not Available) (Second: " << currentSecond << "):\n" // Log which second
+                               << "  TargetHorizDist = " << std::fixed << std::setprecision(1) << std::setw(3) << targetDistance << "\n"
+                               << "  RadarAngle      = " << std::fixed << std::setprecision(1) << std::setw(3) << radarMountAngleDegrees << "\n"
+                               << "  Wall Sensors    = " << wallSensorLogStr << "\n"
+                               << "  MeasuredRange   = " << (hasAnonData && lowestRange != std::numeric_limits<float>::max() ? std::to_string(lowestRange) : "N/A") << "\n"
+                               << "  CalculatedDist  = " << (!std::isnan(actualHorizontalDistance) ? std::to_string(actualHorizontalDistance) : "N/A") << "\n"
+                               << "  Beacon Sensors  = " << beaconSensorLogStr << "\n"
+                               << "  TargetBeaconAz  = " << targetAzimuth << "\n"
+                               << "  CurrentBeaconAz = " << (foundTargetBeacon && !std::isnan(targetBeaconAzimuth) ? std::to_string(targetBeaconAzimuth) : "N/A") << "\n"
+                               << "  LateralInverted = " << std::boolalpha << invertLateralControl
                                << std::endl;
                      std::cout << "--------------------------------------" << std::endl; // Logged
                      // --- END Mode-Specific LOGGING ---
@@ -450,35 +600,260 @@ void extractBeaconAndWallData(const std::vector<RadarObject>& objects, Vehicle* 
             }
             // Reset state variables for the new second (Only those used by W)
             currentSecond = objSecond;
-            lowestRange = std::numeric_limits<float>::max();
-            hasAnonData = false;
-            targetBeaconAzimuth = std::numeric_limits<float>::quiet_NaN();
-            // current_beacon_range = std::numeric_limits<float>::quiet_NaN(); // Not directly used by W control logic
-            foundTargetBeacon = false;
-            // REMOVED resets for Horiz/Rel data
+            lowestRange = std::numeric_limits<float>::max(); // Reset lowest measured range
+            hasAnonData = false; // Reset flag
+            targetBeaconAzimuth = std::numeric_limits<float>::quiet_NaN(); // Reset beacon azimuth
+            foundTargetBeacon = false; // Reset beacon found flag
+            // DO NOT reset yaw variables here, they are for the other mode
         }
 
-        // Accumulate general data for the current second (Needed by W)
-        // Use the CURRENT TARGET_BEACON_ID for comparison
-        if (obj.ID == TARGET_BEACON_ID) {
-            if (!foundTargetBeacon) { // Only store the first one encountered in the second
-                 targetBeaconAzimuth = obj.Az;
-                 // current_beacon_range = obj.Range; // Not directly used by W control logic
-                 foundTargetBeacon = true;
+        // --- Check sensor type independently for Beacon and Anon ---
+
+        // Check if sensor matches criteria for BEACON detection
+        bool beaconSensorMatch = false;
+        if (useBeaconSensorRAz && obj.sensor == "R_Az") {
+            beaconSensorMatch = true;
+        } else if (useBeaconSensorREl && obj.sensor == "R_El") {
+            beaconSensorMatch = true;
+        } else if (useBeaconSensorRAzREl && obj.sensor == "R_Az_R_El") {
+            beaconSensorMatch = true;
+        }
+
+        // Check if sensor matches criteria for WALL detection
+        bool wallSensorMatch = false;
+        if (useWallSensorRAz && obj.sensor == "R_Az") {
+            wallSensorMatch = true;
+        } else if (useWallSensorREl && obj.sensor == "R_El") {
+            wallSensorMatch = true;
+        } else if (useWallSensorRAzREl && obj.sensor == "R_Az_R_El") {
+            wallSensorMatch = true;
+        }
+
+        // Process BEACON if ID and sensor match
+        if (obj.ID == TARGET_BEACON_ID && beaconSensorMatch) {
+            if (!foundTargetBeacon) { // Only store the first one encountered in the second for control
+                targetBeaconAzimuth = obj.Az;
+                foundTargetBeacon = true; // Set flag only if ID and Beacon Sensor match
             }
         }
-        else if (obj.ID.find("anon") != std::string::npos) {
-            hasAnonData = true;
-            if (obj.Range < lowestRange) lowestRange = obj.Range; // Track overall closest anon range
-
-            // REMOVED accumulation for Horiz/Rel data
+        // Process ANON if ID and sensor match
+        else if (obj.ID.find("anon") != std::string::npos && wallSensorMatch) {
+            hasAnonData = true; // Set flag only if ID and Wall Sensor match
+            // Track the lowest *direct* range measured from a *matching* anon object this second
+            if (obj.Range < lowestRange) {
+                lowestRange = obj.Range;
+            }
         }
+        // DO NOT process yaw data here, this is the non-yaw function
          if (stopProcessingFlag.load()) return;
     }
 }
 // --- END FUNCTION FOR [w] --
 
-// --- REMOVED OTHER extractBeaconAndWallData_* FUNCTIONS ---
+
+// --- FUNCTION FOR [w] + Yaw --- //
+void extractWallBeaconYawData(const std::vector<RadarObject>& objects, Vehicle* vehicle, bool enableControl) {
+    for (const auto& obj : objects) {
+         if (stopProcessingFlag.load()) return;
+        std::string ts_cleaned = obj.timestamp;
+        std::string objSecond;
+        size_t dotPos = ts_cleaned.find('.');
+        objSecond = (dotPos != std::string::npos) ? ts_cleaned.substr(0, dotPos) : ts_cleaned;
+        if (!currentSecond.empty() && objSecond < currentSecond) {
+            continue; // Skip objects from a previous second
+        }
+        if (objSecond != currentSecond) { // New second detected
+            // Process control logic for the *previous* second if data was available
+            if (!currentSecond.empty() && (hasAnonData || foundTargetBeacon || hasYawAnonData)) { // Check all relevant flags
+
+                // Get sensor strings for logging based on current settings
+                std::string wallSensorLogStr = getSensorString(useWallSensorRAz, useWallSensorREl, useWallSensorRAzREl);
+                std::string beaconSensorLogStr = getSensorString(useBeaconSensorRAz, useBeaconSensorREl, useBeaconSensorRAzREl);
+                std::string yawSensorLogStr = getSensorString(useYawSensorRAz, useYawSensorREl, useYawSensorRAzREl);
+
+                if (enableControl && vehicle != nullptr && vehicle->control != nullptr) {
+                    float velocity_x = 0.0f;
+                    float actualHorizontalDistance = std::numeric_limits<float>::quiet_NaN();
+
+                    // --- Forward control based on wall distance (using wall sensors) ---
+                    if (hasAnonData && lowestRange != std::numeric_limits<float>::max()) {
+                        float angleRadians = radarMountAngleDegrees * M_PI / 180.0;
+                        actualHorizontalDistance = lowestRange * std::cos(angleRadians);
+                        float difference = actualHorizontalDistance - targetDistance;
+                        if (std::abs(difference) > forward_dead_zone) {
+                            velocity_x = std::max(-max_forward_speed, std::min(Kp_forward * difference, max_forward_speed));
+                        }
+                    }
+
+                    // --- Lateral control based on beacon azimuth (using beacon sensors) ---
+                    float velocity_y = 0.0f;
+                    if (foundTargetBeacon && !std::isnan(targetBeaconAzimuth)) {
+                        float azimuth_error = targetBeaconAzimuth - targetAzimuth;
+                        if (std::abs(azimuth_error) > azimuth_dead_zone) {
+                            float lateral_gain = invertLateralControl ? Kp_lateral : -Kp_lateral;
+                            velocity_y = std::max(-max_lateral_speed, std::min(lateral_gain * azimuth_error, max_lateral_speed));
+                        }
+                    } else if (!foundTargetBeacon && enableControl) {
+                        std::cout << "*** TARGET BEACON ID '" << TARGET_BEACON_ID << "' NOT FOUND FROM SENSORS [" << beaconSensorLogStr << "] ***" << std::endl;
+                    }
+
+                    // --- Yaw control based on azimuth balance (using yaw sensors) ---
+                    float yawRate = 0.0f;
+                    float avgPositiveAz = 0.0f;
+                    float avgNegativeAz = 0.0f;
+                    float yaw_balance_error = 0.0f;
+
+                    if (hasYawAnonData) { // Only calculate if we have relevant data
+                        if (countPositiveAz > 0) {
+                            avgPositiveAz = sumPositiveAz / countPositiveAz;
+                        }
+                        if (countNegativeAz > 0) {
+                            avgNegativeAz = sumNegativeAz / countNegativeAz;
+                        }
+                        // Calculate the balance error (sum of averages)
+                        yaw_balance_error = avgPositiveAz + avgNegativeAz;
+
+                        if (std::fabs(yaw_balance_error) > yaw_azimuth_balance_dead_zone) {
+                            // Yaw rate aims to reduce the balance error (make the sum closer to zero)
+                            // If sum is positive, need negative yaw rate (turn left assuming positive Az is right)
+                            // If sum is negative, need positive yaw rate (turn right assuming positive Az is right)
+                            float yaw_gain = invertYawControl ? Kp_yaw : -Kp_yaw;
+                            yawRate = std::max(-max_yaw_rate, std::min(yaw_gain * yaw_balance_error, max_yaw_rate));
+                        }
+                    }
+
+                    // --- Send Command ---
+                    uint8_t controlFlag = DJI::OSDK::Control::HORIZONTAL_VELOCITY | DJI::OSDK::Control::VERTICAL_VELOCITY |
+                                          DJI::OSDK::Control::YAW_RATE | DJI::OSDK::Control::HORIZONTAL_BODY |
+                                          DJI::OSDK::Control::STABLE_ENABLE;
+                    DJI::OSDK::Control::CtrlData ctrlData(controlFlag, velocity_x, velocity_y, 0, yawRate); // Include yawRate
+
+                    // --- Logging for Yaw Mode ---
+                    std::cout << "[Wall+Beacon+Yaw Follow] Control Status (Second: " << currentSecond << "):\n"
+                              << "  TargetHorizDist = " << std::fixed << std::setprecision(1) << std::setw(3) << targetDistance << "\n"
+                              << "  RadarAngle      = " << std::fixed << std::setprecision(1) << std::setw(3) << radarMountAngleDegrees << "\n"
+                              << "  Wall Sensors    = " << wallSensorLogStr << "\n"
+                              << "  MeasuredRange   = " << (hasAnonData && lowestRange != std::numeric_limits<float>::max() ? std::to_string(lowestRange) : "N/A") << "\n"
+                              << "  CalculatedDist  = " << (!std::isnan(actualHorizontalDistance) ? std::to_string(actualHorizontalDistance) : "N/A") << "\n"
+                              << "  Beacon Sensors  = " << beaconSensorLogStr << "\n"
+                              << "  TargetBeaconAz  = " << targetAzimuth << "\n"
+                              << "  CurrentBeaconAz = " << (foundTargetBeacon && !std::isnan(targetBeaconAzimuth) ? std::to_string(targetBeaconAzimuth) : "N/A") << "\n"
+                              << "  LateralInverted = " << std::boolalpha << invertLateralControl << "\n"
+                              << "  Yaw Sensors     = " << yawSensorLogStr << "\n"
+                              << "  Avg Pos Az      = " << avgPositiveAz << " (Count: " << countPositiveAz << ")\n"
+                              << "  Avg Neg Az      = " << avgNegativeAz << " (Count: " << countNegativeAz << ")\n"
+                              << "  Az Balance Err  = " << yaw_balance_error << "\n"
+                              << "  Yaw Inverted    = " << std::boolalpha << invertYawControl << "\n"
+                              << "\n"
+                              << "  Computed Velocity(X=" << velocity_x << ", Y=" << velocity_y << ", YawRate=" << yawRate << ")" << std::endl;
+                    std::cout << "--------------------------------------" << std::endl;
+
+                    vehicle->control->flightCtrl(ctrlData);
+                } else if (hasAnonData || foundTargetBeacon || hasYawAnonData) { // Logging when control disabled
+                    float actualHorizontalDistance = std::numeric_limits<float>::quiet_NaN();
+                     if (hasAnonData && lowestRange != std::numeric_limits<float>::max()) {
+                        float angleRadians = radarMountAngleDegrees * M_PI / 180.0;
+                        actualHorizontalDistance = lowestRange * std::cos(angleRadians);
+                     }
+                     if (!foundTargetBeacon) {
+                         std::cout << "*** TARGET BEACON ID '" << TARGET_BEACON_ID << "' NOT FOUND FROM SENSORS [" << beaconSensorLogStr << "] ***" << std::endl;
+                     }
+                    float avgPositiveAz = (countPositiveAz > 0) ? (sumPositiveAz / countPositiveAz) : 0.0f;
+                    float avgNegativeAz = (countNegativeAz > 0) ? (sumNegativeAz / countNegativeAz) : 0.0f;
+                    float yaw_balance_error = avgPositiveAz + avgNegativeAz;
+
+                     std::cout << "[Wall+Beacon+Yaw Follow] (Flight Control Disabled or Not Available) (Second: " << currentSecond << "):\n"
+                               << "  TargetHorizDist = " << std::fixed << std::setprecision(1) << std::setw(3) << targetDistance << "\n"
+                               << "  RadarAngle      = " << std::fixed << std::setprecision(1) << std::setw(3) << radarMountAngleDegrees << "\n"
+                               << "  Wall Sensors    = " << wallSensorLogStr << "\n"
+                               << "  MeasuredRange   = " << (hasAnonData && lowestRange != std::numeric_limits<float>::max() ? std::to_string(lowestRange) : "N/A") << "\n"
+                               << "  CalculatedDist  = " << (!std::isnan(actualHorizontalDistance) ? std::to_string(actualHorizontalDistance) : "N/A") << "\n"
+                               << "  Beacon Sensors  = " << beaconSensorLogStr << "\n"
+                               << "  TargetBeaconAz  = " << targetAzimuth << "\n"
+                               << "  CurrentBeaconAz = " << (foundTargetBeacon && !std::isnan(targetBeaconAzimuth) ? std::to_string(targetBeaconAzimuth) : "N/A") << "\n"
+                               << "  LateralInverted = " << std::boolalpha << invertLateralControl << "\n"
+                               << "  Yaw Sensors     = " << yawSensorLogStr << "\n"
+                               << "  Avg Pos Az      = " << avgPositiveAz << " (Count: " << countPositiveAz << ")\n"
+                               << "  Avg Neg Az      = " << avgNegativeAz << " (Count: " << countNegativeAz << ")\n"
+                               << "  Az Balance Err  = " << yaw_balance_error << "\n"
+                               << "  Yaw Inverted    = " << std::boolalpha << invertYawControl
+                               << std::endl;
+                     std::cout << "--------------------------------------" << std::endl;
+                }
+            }
+            // Reset state variables for the new second
+            currentSecond = objSecond;
+            // Reset Wall/Beacon vars
+            lowestRange = std::numeric_limits<float>::max();
+            hasAnonData = false;
+            targetBeaconAzimuth = std::numeric_limits<float>::quiet_NaN();
+            foundTargetBeacon = false;
+            // Reset Yaw vars
+            sumPositiveAz = 0.0f;
+            countPositiveAz = 0;
+            sumNegativeAz = 0.0f;
+            countNegativeAz = 0;
+            hasYawAnonData = false;
+        }
+
+        // --- Check sensor type independently for Beacon, Wall Anon, Yaw Anon ---
+
+        // Check if sensor matches criteria for BEACON detection
+        bool beaconSensorMatch = false;
+        if (useBeaconSensorRAz && obj.sensor == "R_Az") beaconSensorMatch = true;
+        else if (useBeaconSensorREl && obj.sensor == "R_El") beaconSensorMatch = true;
+        else if (useBeaconSensorRAzREl && obj.sensor == "R_Az_R_El") beaconSensorMatch = true;
+
+        // Check if sensor matches criteria for WALL distance calculation
+        bool wallSensorMatch = false;
+        if (useWallSensorRAz && obj.sensor == "R_Az") wallSensorMatch = true;
+        else if (useWallSensorREl && obj.sensor == "R_El") wallSensorMatch = true;
+        else if (useWallSensorRAzREl && obj.sensor == "R_Az_R_El") wallSensorMatch = true;
+
+        // Check if sensor matches criteria for YAW calculation
+        bool yawSensorMatch = false;
+        if (useYawSensorRAz && obj.sensor == "R_Az") yawSensorMatch = true;
+        else if (useYawSensorREl && obj.sensor == "R_El") yawSensorMatch = true;
+        else if (useYawSensorRAzREl && obj.sensor == "R_Az_R_El") yawSensorMatch = true;
+
+
+        // --- Process data based on ID and matching sensor criteria ---
+
+        // Process BEACON if ID and sensor match
+        if (obj.ID == TARGET_BEACON_ID && beaconSensorMatch) {
+            if (!foundTargetBeacon) { // Only store the first one encountered in the second
+                targetBeaconAzimuth = obj.Az;
+                foundTargetBeacon = true;
+            }
+        }
+        // Process ANON object
+        else if (obj.ID.find("anon") != std::string::npos) {
+            // Check for WALL distance calculation
+            if (wallSensorMatch) {
+                hasAnonData = true;
+                if (obj.Range < lowestRange) {
+                    lowestRange = obj.Range;
+                }
+            }
+            // Check for YAW calculation
+            if (yawSensorMatch) {
+                 hasYawAnonData = true; // Mark that we have relevant data for yaw
+                 if (obj.Az > 0) {
+                     sumPositiveAz += obj.Az;
+                     countPositiveAz++;
+                 } else if (obj.Az < 0) {
+                     sumNegativeAz += obj.Az; // Add the negative value
+                     countNegativeAz++;
+                 }
+                 // Ignore Az == 0 for averaging
+            }
+        }
+        // --- END Data Processing ---
+         if (stopProcessingFlag.load()) return;
+    }
+}
+// --- END FUNCTION FOR [w] + Yaw --
+
 
 // Parses JSON radar data (Keep)
 std::vector<RadarObject> parseRadarData(const std::string& jsonData) {
@@ -495,7 +870,14 @@ std::vector<RadarObject> parseRadarData(const std::string& jsonData) {
                 continue;
             }
             RadarObject radarObj;
-            radarObj.timestamp = obj.value("timestamp", json(nullptr)).dump();
+            // Clean timestamp string (remove quotes if present)
+            if (obj.contains("timestamp") && obj["timestamp"].is_string()) {
+                radarObj.timestamp = obj.value("timestamp", "");
+                if (!radarObj.timestamp.empty() && radarObj.timestamp.front() == '"') radarObj.timestamp.erase(0, 1);
+                if (!radarObj.timestamp.empty() && radarObj.timestamp.back() == '"') radarObj.timestamp.pop_back();
+            } else {
+                radarObj.timestamp = obj.value("timestamp", json(nullptr)).dump(); // Fallback for non-string or null
+            }
             radarObj.sensor = obj.value("sensor", "N/A");
             radarObj.src = obj.value("src", "N/A");
             radarObj.X = obj.value("X", 0.0f); radarObj.Y = obj.value("Y", 0.0f); radarObj.Z = obj.value("Z", 0.0f);
@@ -635,14 +1017,14 @@ void ReleaseJoystickCtrlAuthorityCB(ErrorCode::ErrorCodeType errorCode, UserData
 
 // Enum for processing modes (Simplified)
 enum class ProcessingMode {
-    WALL_FOLLOW,     // Mode for [w]
-    PROCESS_FULL     // Mode for [e]
-    // REMOVED OTHER MODES
+    WALL_FOLLOW,         // Mode for [w]
+    PROCESS_FULL,        // Mode for [e]
+    WALL_BEACON_YAW      // Mode for Wall+Beacon+Yaw
 };
 
-// Processing loop function (Modified for Reconnection Logic with Delay)
+// Processing loop function (Modified for Reconnection Logic with Delay & GUI Data Update & Broader Beacon Match)
 void processingLoopFunction(const std::string bridgeScriptName, Vehicle* vehicle, bool enableControlCmd, ProcessingMode mode) {
-    std::cout << "Processing thread started. Bridge: " << bridgeScriptName << ", Control Enabled: " << std::boolalpha << enableControlCmd << ", Mode: " << static_cast<int>(mode) << ", Reconnect Enabled: " << enable_bridge_reconnection << std::endl; // Logged (Added reconnect status)
+    std::cout << "Processing thread started. Bridge: " << bridgeScriptName << ", Control Enabled: " << std::boolalpha << enableControlCmd << ", Mode: " << static_cast<int>(mode) << ", Reconnect Enabled: " << enable_bridge_reconnection << std::endl; // Logged
     int functionTimeout = 1; // Timeout for OSDK control calls
 
     runPythonBridge(bridgeScriptName);
@@ -664,6 +1046,9 @@ void processingLoopFunction(const std::string bridgeScriptName, Vehicle* vehicle
             else std::cout << "[Processing Thread] Control authority released." << std::endl; // Logged
         }
         // Status is already set to DISCONNECTED by connectToPythonBridge on failure
+        // Clear global GUI data on exit
+        { std::lock_guard<std::mutex> lockB(g_beaconMutex); g_beaconObjects.clear(); }
+        { std::lock_guard<std::mutex> lockA(g_anonMutex); g_anonObjects.clear(); }
         return; // Exit thread
     }
     // If we reach here, connectToPythonBridge succeeded and set status to CONNECTED.
@@ -672,13 +1057,20 @@ void processingLoopFunction(const std::string bridgeScriptName, Vehicle* vehicle
     std::array<char, 4096> read_buffer;
     bool connection_error_occurred = false; // Track if we are in an error state
 
-    // Reset state variables used by 'w' before the loop starts
+    // Reset state variables used by control modes before the loop starts
     currentSecond = "";
+    // Wall/Beacon vars
     lowestRange = std::numeric_limits<float>::max();
     hasAnonData = false;
     targetBeaconAzimuth = std::numeric_limits<float>::quiet_NaN();
     foundTargetBeacon = false;
-    // REMOVED reset for unused state variables
+    // Yaw vars
+    sumPositiveAz = 0.0f;
+    countPositiveAz = 0;
+    sumNegativeAz = 0.0f;
+    countNegativeAz = 0;
+    hasYawAnonData = false;
+
 
     while (!stopProcessingFlag.load()) {
         boost::system::error_code error;
@@ -715,6 +1107,9 @@ void processingLoopFunction(const std::string bridgeScriptName, Vehicle* vehicle
                     std::cout << "[Processing Thread] Stop requested during reconnection delay." << std::endl;
                     forceStopReconnectionFlag.store(false); // Reset flag
                     currentBridgeStatus.store(BridgeConnectionStatus::DISCONNECTED); // Set status
+                    // Clear global GUI data on stop during reconnect
+                    { std::lock_guard<std::mutex> lockB(g_beaconMutex); g_beaconObjects.clear(); }
+                    { std::lock_guard<std::mutex> lockA(g_anonMutex); g_anonObjects.clear(); }
                     break; // Exit the main while loop
                 }
                 // --- END DELAY ---
@@ -730,11 +1125,17 @@ void processingLoopFunction(const std::string bridgeScriptName, Vehicle* vehicle
                     // Connection failed OR was force stopped
                     // connectToPythonBridge set status to DISCONNECTED
                     std::cerr << "Processing thread: Persistent reconnection failed or was stopped. Exiting." << std::endl; // Logged
+                    // Clear global GUI data on failed reconnect
+                    { std::lock_guard<std::mutex> lockB(g_beaconMutex); g_beaconObjects.clear(); }
+                    { std::lock_guard<std::mutex> lockA(g_anonMutex); g_anonObjects.clear(); }
                     break; // Exit the main while loop
                 }
             } else {
                 std::cerr << "Reconnection disabled. Stopping processing." << std::endl; // Logged
                 currentBridgeStatus.store(BridgeConnectionStatus::DISCONNECTED); // Set status
+                // Clear global GUI data when stopping due to disabled reconnect
+                { std::lock_guard<std::mutex> lockB(g_beaconMutex); g_beaconObjects.clear(); }
+                { std::lock_guard<std::mutex> lockA(g_anonMutex); g_anonObjects.clear(); }
                 break; // Exit the main while loop if reconnection is disabled
             }
         }
@@ -757,18 +1158,36 @@ void processingLoopFunction(const std::string bridgeScriptName, Vehicle* vehicle
                     try {
                         auto radarObjects = parseRadarData(jsonData);
 
-                        // Simplified Switch case
+                        // --- Update Global Data for GUI ---
+                        {
+                            std::lock_guard<std::mutex> lockB(g_beaconMutex);
+                            g_beaconObjects.clear(); // Store only the latest frame's objects
+                            std::lock_guard<std::mutex> lockA(g_anonMutex);
+                            g_anonObjects.clear(); // Store only the latest frame's objects
+
+                            for (const auto& obj : radarObjects) {
+                                // Check if ID contains "BEACON" (case-sensitive) for the GUI display
+                                if (obj.ID.find("BEACON") != std::string::npos) {
+                                    g_beaconObjects.push_back(obj);
+                                }
+                                // Check if ID contains "anon" for the GUI display
+                                else if (obj.ID.find("anon") != std::string::npos) {
+                                    g_anonObjects.push_back(obj);
+                                }
+                            }
+                        }
+                        // --- End Update Global Data ---
+
+
+                        // Call appropriate processing function based on mode
                         switch (mode) {
                             case ProcessingMode::WALL_FOLLOW:
-                                extractBeaconAndWallData(radarObjects, vehicle, enableControlCmd); // Uses CURRENT global parameters
+                                extractBeaconAndWallData(radarObjects, vehicle, enableControlCmd);
                                 break;
                             case ProcessingMode::PROCESS_FULL:
-                                // Call displayRadarObjects directly for mode 'e'
                                 // Need to update currentSecond for the display header
                                 if (!radarObjects.empty()) {
                                     std::string ts_cleaned = radarObjects[0].timestamp;
-                                    if (!ts_cleaned.empty() && ts_cleaned.front() == '"') ts_cleaned.erase(0, 1);
-                                    if (!ts_cleaned.empty() && ts_cleaned.back() == '"') ts_cleaned.pop_back();
                                     size_t dotPos = ts_cleaned.find('.');
                                     std::string objSecond = (dotPos != std::string::npos) ? ts_cleaned.substr(0, dotPos) : ts_cleaned;
                                     if (objSecond != currentSecond) {
@@ -777,7 +1196,9 @@ void processingLoopFunction(const std::string bridgeScriptName, Vehicle* vehicle
                                 }
                                 displayRadarObjects(radarObjects); // Direct call for this mode
                                 break;
-                            // REMOVED OTHER CASES
+                            case ProcessingMode::WALL_BEACON_YAW: // ** NEW CASE **
+                                extractWallBeaconYawData(radarObjects, vehicle, enableControlCmd);
+                                break;
                         }
 
                     } catch (const std::exception& e) {
@@ -800,6 +1221,10 @@ void processingLoopFunction(const std::string bridgeScriptName, Vehicle* vehicle
 
     if (socket.is_open()) { socket.close(); }
     stopPythonBridge(bridgeScriptName);
+
+    // Clear global GUI data on thread exit
+    { std::lock_guard<std::mutex> lockB(g_beaconMutex); g_beaconObjects.clear(); }
+    { std::lock_guard<std::mutex> lockA(g_anonMutex); g_anonObjects.clear(); }
 
     // Release Control Authority if enabled AND vehicle objects are valid
     if (enableControlCmd && vehicle != nullptr && vehicle->control != nullptr) {
@@ -950,9 +1375,13 @@ void stopProcessingThreadIfNeeded() {
         stopProcessingFlag.store(false); // Reset flag for next potential thread start
         forceStopReconnectionFlag.store(false); // Reset flag
         // Status is set to DISCONNECTED inside the thread function upon exit
+        // Global data is cleared inside thread function upon exit
     } else {
          // Ensure status is DISCONNECTED if no thread is running
          currentBridgeStatus.store(BridgeConnectionStatus::DISCONNECTED);
+         // Clear global data if no thread was running (e.g., on startup quit)
+         { std::lock_guard<std::mutex> lockB(g_beaconMutex); g_beaconObjects.clear(); }
+         { std::lock_guard<std::mutex> lockA(g_anonMutex); g_anonObjects.clear(); }
     }
 }
 
@@ -965,7 +1394,7 @@ int main(int argc, char** argv) {
     std::cout << "Starting application: " << (argc > 0 ? argv[0] : "djiosdk-flightcontrol-gui") << std::endl; // Logged (Updated name)
 
     std::cout << "[Main] Calling loadPreferences()..." << std::endl;
-    loadPreferences(); // Load preferences next (including connect_to_drone)
+    loadPreferences(); // Load preferences next (including independent sensor selections)
     std::cout << "[Main] Returned from loadPreferences()." << std::endl;
 
     // --- OSDK Initialization (Now Conditional) ---
@@ -1120,7 +1549,7 @@ int main(int argc, char** argv) {
     //ImGui::StyleColorsClassic();
 
     // Setup Platform/Renderer backends
-    ImGui_ImplSDL2_InitForOpenGL(window, gl_context); // CORRECTED FUNCTION CALL
+    ImGui_ImplSDL2_InitForOpenGL(window, gl_context); // Use correct function for OpenGL
     ImGui_ImplOpenGL3_Init(glsl_version);
 
     // GUI state
@@ -1132,260 +1561,446 @@ int main(int argc, char** argv) {
     strncpy(target_beacon_id_buffer, TARGET_BEACON_ID.c_str(), sizeof(target_beacon_id_buffer) - 1);
     target_beacon_id_buffer[sizeof(target_beacon_id_buffer) - 1] = '\0'; // Ensure null termination
 
+    // --- Window Size Variables ---
+    const float side_window_width = 400.0f;    // Define width for side windows (Menu, Detections)
+    const float bottom_window_height = 240.0f; // Define height for bottom windows
+
     std::cout << "[GUI] Entering main GUI loop..." << std::endl;
     // --- Main GUI Loop ---
     while (guiKeepRunning) {
         // Poll and handle events (inputs, window resize, etc.)
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
-            ImGui_ImplSDL2_ProcessEvent(&event); // CORRECTED FUNCTION CALL
+            ImGui_ImplSDL2_ProcessEvent(&event); // Process SDL events for ImGui
             if (event.type == SDL_QUIT)
-                guiKeepRunning = false;
+                guiKeepRunning = false; // Catch window close event
             if (event.type == SDL_WINDOWEVENT && event.window.event == SDL_WINDOWEVENT_CLOSE && event.window.windowID == SDL_GetWindowID(window))
-                guiKeepRunning = false;
+                guiKeepRunning = false; // Also catch explicit window close event
         }
 
         // Start the Dear ImGui frame
         ImGui_ImplOpenGL3_NewFrame();
-        ImGui_ImplSDL2_NewFrame(); // CORRECTED FUNCTION CALL
+        ImGui_ImplSDL2_NewFrame(); // Start ImGui frame for SDL
         ImGui::NewFrame();
 
         // --- GUI Windows ---
+        ImGuiViewport* viewport = ImGui::GetMainViewport(); // Get main viewport once for all windows
+        const float padding = 10.0f; // Padding from window edges
+        ImVec2 work_pos = viewport->WorkPos; // Top-left of usable area
+        ImVec2 work_size = viewport->WorkSize; // Size of usable area
 
-        // --- Top Center Status Indicator (REVISED SCALING/CENTERING - Attempt 2) ---
+        // --- Status Text Variables (Used Later for Drawing) ---
+        const char* statusText = "";
+        ImVec4 statusColor = ImVec4(1.0f, 0.0f, 0.0f, 1.0f); // Default Red
+        const float desiredScale = 2.0f;
+        ImVec2 textPos = ImVec2(0,0);
+        float scaledFontSize = io.Fonts->Fonts[0]->FontSize * desiredScale; // Calculate scaled font size
+
+        // --- Determine Status Text and Color ---
         {
-            ImGuiViewport* viewport = ImGui::GetMainViewport();
-            ImVec2 work_pos = viewport->WorkPos;
-            ImVec2 work_size = viewport->WorkSize;
-
             const ImVec4 green = ImVec4(0.0f, 1.0f, 0.0f, 1.0f);
             const ImVec4 red = ImVec4(1.0f, 0.0f, 0.0f, 1.0f);
             const ImVec4 orange = ImVec4(1.0f, 0.65f, 0.0f, 1.0f);
-
             BridgeConnectionStatus status = currentBridgeStatus.load();
-            const char* statusText = "";
-            ImVec4 statusColor = red;
 
             switch(status) {
                 case BridgeConnectionStatus::CONNECTED:
-                    statusText = "Radar Bridge: Connected";
+                    statusText = "Radar: Connected";
                     statusColor = green;
                     break;
                 case BridgeConnectionStatus::DISCONNECTED:
-                    statusText = "Radar Bridge: Disconnected";
+                    statusText = "Radar: Disconnected";
                     statusColor = red;
                     break;
                 case BridgeConnectionStatus::RECONNECTING:
-                    statusText = "Radar Bridge: Attempting Reconnect...";
+                    statusText = "Radar: Attempting Reconnect...";
                     statusColor = orange;
                     break;
             }
 
-            // --- START FONT SCALING ---
-            const float desiredScale = 3.0f; // Increase scale factor (e.g., 3.0f)
+            // --- Calculate Text Size (using the specific scaled font size) and Position ---
+            // Temporarily push font scale *only* for size calculation if AddText doesn't handle it well
+            // ImGui::PushFont(io.Fonts->Fonts[0]); // Select font
+            // ImGui::SetWindowFontScale(desiredScale); // Set scale for calculation
+            // ImVec2 scaledTextSize = ImGui::CalcTextSize(statusText);
+            // ImGui::SetWindowFontScale(1.0f); // Reset scale
+            // ImGui::PopFont();
+            // --- OR --- Calculate size with base font and scale manually (Try this first)
+            ImVec2 baseTextSize = ImGui::CalcTextSize(statusText);
+            float scaledTextWidth = baseTextSize.x * desiredScale;
 
-            // Calculate text size *with the scale factor* for accurate centering
-            ImVec2 textSize = ImGui::CalcTextSize(statusText);
-            textSize.x *= desiredScale;
-            textSize.y *= desiredScale;
 
-
-            // Position the containing window near top-center based on scaled size
-            float verticalPadding = 10.0f; // Simple fixed padding from top
-            ImVec2 windowPos = ImVec2(work_pos.x + (work_size.x - textSize.x) * 0.5f, work_pos.y + verticalPadding);
-
-            // Set position and make background transparent
-            ImGui::SetNextWindowPos(windowPos, ImGuiCond_Always); // Use Always to prevent drift
-            ImGui::SetNextWindowBgAlpha(0.0f); // Transparent background
-
-            // Create the invisible window - Use AutoResize flag, remove manual size setting
-            ImGuiWindowFlags windowFlags = ImGuiWindowFlags_NoDecoration |
-                                           ImGuiWindowFlags_AlwaysAutoResize | // Let ImGui size it
-                                           ImGuiWindowFlags_NoSavedSettings |
-                                           ImGuiWindowFlags_NoFocusOnAppearing |
-                                           ImGuiWindowFlags_NoNav |
-                                           ImGuiWindowFlags_NoMove |
-                                           ImGuiWindowFlags_NoBackground;
-
-            ImGui::Begin("StatusIndicator", nullptr, windowFlags);
-
-            // Apply scaling *inside* the window, before drawing text
-            ImGui::SetWindowFontScale(desiredScale);
-
-            // Draw the scaled, colored text (Centering should be handled by window auto-resize)
-            ImGui::TextColored(statusColor, "%s", statusText);
-
-            // Reset scale immediately after drawing the text
-            ImGui::SetWindowFontScale(1.0f);
-
-            ImGui::End(); // End StatusIndicator window
-            // --- END FONT SCALING ---
+            float verticalPadding = 10.0f;
+            float mainMenuRightEdgeX = work_pos.x + padding + side_window_width;
+            float textPosX = mainMenuRightEdgeX - scaledTextWidth; // Align right edge by subtracting scaled width
+            float textPosY = work_pos.y + verticalPadding;
+            textPos = ImVec2(std::max(work_pos.x, textPosX), std::max(work_pos.y, textPosY)); // Ensure it's on screen
         }
-        // --- END Status Indicator ---
+        // --- END Status Text Determination ---
 
 
-        // 1. Main Menu Window (Top Left)
-        ImGui::Begin("Main Menu");
+        // --- REMOVED StatusIndicator Window Block ---
+
+
+        // 1. Main Menu Window (Top Left - Fixed Width)
         {
-            // Wall Following Button
-            // Disable if flight control flag is false (set during init based on connect_to_drone and success)
-            if (!enableFlightControl) {
-                ImGui::BeginDisabled();
-            }
+            ImVec2 window_pos = ImVec2(work_pos.x + padding, work_pos.y + padding);
+            ImVec2 window_pos_pivot = ImVec2(0.0f, 0.0f); // Pivot at top-left
+            ImGui::SetNextWindowPos(window_pos, ImGuiCond_Always, window_pos_pivot); // Pin to top-left
+            // SET FIXED WIDTH
+            ImGui::SetNextWindowSize(ImVec2(side_window_width, 0), ImGuiCond_Always); // Fixed width, auto height
+            ImGui::SetNextWindowBgAlpha(0.65f);
+            // REMOVED AlwaysAutoResize Flag
+            ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav;
+
+            ImGui::Begin("Main Menu", nullptr, window_flags);
+
+            // --- Wall+Beacon Following Button ---
+            if (!enableFlightControl) ImGui::BeginDisabled();
             if (ImGui::Button("Start Wall+Beacon Following [w]")) {
                 std::cout << "[GUI] 'w' button clicked." << std::endl;
-                stopProcessingThreadIfNeeded(); // Stop previous task first
-                forceStopReconnectionFlag.store(false); // Ensure flag is reset before starting
-
-                // Double-check vehicle and control are valid before obtaining authority
+                stopProcessingThreadIfNeeded();
+                forceStopReconnectionFlag.store(false);
                 if (enableFlightControl && vehicle != nullptr && vehicle->control != nullptr) {
                     std::cout << "[GUI] Attempting to obtain Control Authority for Wall Following..." << std::endl;
                     ACK::ErrorCode ctrlAuthAck = vehicle->control->obtainCtrlAuthority(functionTimeout);
                     if (ACK::getError(ctrlAuthAck)) {
                         ACK::getErrorCodeMessage(ctrlAuthAck, "[GUI] Wall Following obtainCtrlAuthority");
                         std::cerr << "[GUI] Failed to obtain control authority. Cannot start 'w' with control." << std::endl;
-                        currentBridgeStatus.store(BridgeConnectionStatus::DISCONNECTED); // Ensure status is correct if thread doesn't start
-                        // Optionally show an ImGui popup here
+                        currentBridgeStatus.store(BridgeConnectionStatus::DISCONNECTED);
                     } else {
                         std::cout << "[GUI] Obtained Control Authority for Wall Following." << std::endl;
-                        stopProcessingFlag.store(false); // Ensure this is reset too
-                        // Status will be set inside processingLoopFunction
+                        stopProcessingFlag.store(false);
                         processingThread = std::thread(processingLoopFunction, defaultPythonBridgeScript, vehicle, true, ProcessingMode::WALL_FOLLOW);
                     }
                 } else {
-                     // This should only happen if enableFlightControl was somehow true but vehicle pointers are bad (unlikely now)
-                     // Or if the button wasn't properly disabled.
                      std::cerr << "[GUI] Cannot start 'w' with control: Flight control disabled or OSDK not ready." << std::endl;
-                     currentBridgeStatus.store(BridgeConnectionStatus::DISCONNECTED); // Ensure status is correct
+                     currentBridgeStatus.store(BridgeConnectionStatus::DISCONNECTED);
                 }
             }
-            if (!enableFlightControl) {
+            if (!enableFlightControl) ImGui::EndDisabled();
+
+            // --- Wall+Beacon+Yaw Following Button ---
+            if (!enableFlightControl) ImGui::BeginDisabled();
+            if (ImGui::Button("Start Wall+Beacon Following + Yaw Control")) {
+                std::cout << "[GUI] 'Wall+Beacon+Yaw' button clicked." << std::endl;
+                stopProcessingThreadIfNeeded();
+                forceStopReconnectionFlag.store(false);
+                if (enableFlightControl && vehicle != nullptr && vehicle->control != nullptr) {
+                    std::cout << "[GUI] Attempting to obtain Control Authority for Wall+Beacon+Yaw..." << std::endl;
+                    ACK::ErrorCode ctrlAuthAck = vehicle->control->obtainCtrlAuthority(functionTimeout);
+                    if (ACK::getError(ctrlAuthAck)) {
+                        ACK::getErrorCodeMessage(ctrlAuthAck, "[GUI] Wall+Beacon+Yaw obtainCtrlAuthority");
+                        std::cerr << "[GUI] Failed to obtain control authority. Cannot start Wall+Beacon+Yaw with control." << std::endl;
+                        currentBridgeStatus.store(BridgeConnectionStatus::DISCONNECTED);
+                    } else {
+                        std::cout << "[GUI] Obtained Control Authority for Wall+Beacon+Yaw." << std::endl;
+                        stopProcessingFlag.store(false);
+                        // Start the thread with the NEW mode and NEW function
+                        processingThread = std::thread(processingLoopFunction, defaultPythonBridgeScript, vehicle, true, ProcessingMode::WALL_BEACON_YAW);
+                    }
+                } else {
+                     std::cerr << "[GUI] Cannot start Wall+Beacon+Yaw with control: Flight control disabled or OSDK not ready." << std::endl;
+                     currentBridgeStatus.store(BridgeConnectionStatus::DISCONNECTED);
+                }
+            }
+             if (!enableFlightControl) {
                 ImGui::EndDisabled();
-                ImGui::SameLine(); // Add tooltip or text next to disabled button
+                ImGui::SameLine();
                 ImGui::TextDisabled("(Flight Control Disabled)");
             }
 
-            // Process Full Radar Button
+
+            // --- Process Full Radar Button ---
             if (ImGui::Button("Process Full Radar [e]")) {
                  std::cout << "[GUI] 'e' button clicked." << std::endl;
-                 stopProcessingThreadIfNeeded(); // Stop previous task first
-                 forceStopReconnectionFlag.store(false); // Ensure flag is reset before starting
+                 stopProcessingThreadIfNeeded();
+                 forceStopReconnectionFlag.store(false);
                  std::cout << "[GUI] Starting Radar Data processing (Full, No Control)..." << std::endl;
-                 stopProcessingFlag.store(false); // Ensure this is reset too
-                 // Status will be set inside processingLoopFunction
+                 stopProcessingFlag.store(false);
                  processingThread = std::thread(processingLoopFunction, defaultPythonBridgeScript, nullptr, false, ProcessingMode::PROCESS_FULL);
             }
 
-            // NEW: Stop Reconnection Button
-            // Show only if reconnection is enabled AND a processing thread might be active
+            // --- Stop Reconnect Button ---
             if (enable_bridge_reconnection) {
-                // Only enable if a thread is running AND the current status is RECONNECTING
                 bool should_enable_stop_reconnect = processingThread.joinable() && (currentBridgeStatus.load() == BridgeConnectionStatus::RECONNECTING);
-
-                if (!should_enable_stop_reconnect) {
-                    ImGui::BeginDisabled(); // Disable if no thread is running or not in reconnecting state
-                }
+                if (!should_enable_stop_reconnect) ImGui::BeginDisabled();
                 if (ImGui::Button("Stop Reconnection Attempt")) {
                     std::cout << "[GUI] 'Stop Reconnection Attempt' button clicked." << std::endl;
-                    forceStopReconnectionFlag.store(true); // Signal the reconnection loop to stop
-                    // The processing thread will update the status to DISCONNECTED when it stops
+                    forceStopReconnectionFlag.store(true);
                 }
-                if (!should_enable_stop_reconnect) {
-                    ImGui::EndDisabled();
-                }
+                if (!should_enable_stop_reconnect) ImGui::EndDisabled();
             }
 
-
-            // Quit Button
-            if (ImGui::Button("Quit [q]")) {
-                std::cout << "[GUI] 'q' button clicked." << std::endl;
-                guiKeepRunning = false; // Signal GUI loop to exit
-            }
+            ImGui::End(); // End Main Menu
         }
-        ImGui::End();
 
 
-        // 2. Parameters Window (Top Right - Now with Input Fields and Logging)
+        // 2. Parameters Window (Top Right - Layout using Groups and SameLine)
         {
-            ImGuiIO& current_io = ImGui::GetIO();
-            ImVec2 window_pos = ImVec2(current_io.DisplaySize.x - 10.0f, 10.0f); // Position from top-right
+            ImVec2 window_pos = ImVec2(viewport->WorkPos.x + viewport->WorkSize.x - padding, viewport->WorkPos.y + padding); // Position from top-right corner of work area
             ImVec2 window_pos_pivot = ImVec2(1.0f, 0.0f); // Pivot at top-right
-            ImGui::SetNextWindowPos(window_pos, ImGuiCond_Appearing, window_pos_pivot); // Use Appearing condition
-            ImGui::SetNextWindowBgAlpha(0.65f); // Slightly less transparent
-            ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_AlwaysAutoResize; // Allow move/resize, auto-resize width
+            ImGui::SetNextWindowPos(window_pos, ImGuiCond_Always, window_pos_pivot); // Use Always condition to pin
+            ImGui::SetNextWindowSize(ImVec2(600, 0), ImGuiCond_Appearing); // Set initial width, height adjusts automatically
+            ImGui::SetNextWindowBgAlpha(0.65f);
+            ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav; // Removed AlwaysAutoResize
 
             ImGui::Begin("Parameters", nullptr, window_flags);
+
+            // --- Status Section (Full Width) ---
             ImGui::Text("Status");
             ImGui::Separator();
-            ImGui::Text("Connect to Drone: %s", connect_to_drone ? "True" : "False"); // Not editable runtime
-            ImGui::Text("Flight Control: %s", enableFlightControl ? "Enabled" : "Disabled"); // Status display
+            ImGui::Text("Connect to Drone: %s", connect_to_drone ? "True" : "False");
+            ImGui::Text("Flight Control: %s", enableFlightControl ? "Enabled" : "Disabled");
             ImGui::Separator();
+
+            // --- Connection Section (Full Width) ---
+            ImGui::Text("Connection");
+            ImGui::Separator();
+            if (ImGui::Checkbox("Bridge Reconnect", &enable_bridge_reconnection)) {
+                 std::cout << "[GUI Param Update] Bridge Reconnect set to: " << std::boolalpha << enable_bridge_reconnection << std::endl;
+            }
+            ImGui::Separator();
+
+            // --- Paired Sections using BeginGroup / SameLine ---
+            float groupWidth = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f; // Recalculate group width dynamically
+
+            // --- Pair 1: Editable Parameters | Yaw Control ---
+            ImGui::BeginGroup(); // Start Left Group (Editable Params)
             ImGui::Text("Editable Parameters");
             ImGui::Separator();
-
-            // --- Editable Parameters ---
-            // Target Beacon ID
-            if (ImGui::InputText("Target Beacon ID", target_beacon_id_buffer, sizeof(target_beacon_id_buffer))) {
-                TARGET_BEACON_ID = target_beacon_id_buffer; // Update the global std::string
-                std::cout << "[GUI Param Update] Target Beacon ID set to: " << TARGET_BEACON_ID << std::endl; // Log change
+            ImGui::PushItemWidth(groupWidth * 0.9f); // Adjust item width within group
+            if (ImGui::InputText("##TargetBeaconID", target_beacon_id_buffer, sizeof(target_beacon_id_buffer))) { // Use ## for hidden label
+                TARGET_BEACON_ID = target_beacon_id_buffer;
+                std::cout << "[GUI Param Update] Target Beacon ID set to: " << TARGET_BEACON_ID << std::endl;
             }
-
-            // Target Distance
-            if (ImGui::InputFloat("Target Distance (m)", &targetDistance, 0.1f, 1.0f, "%.3f")) {
-                 std::cout << "[GUI Param Update] Target Distance set to: " << targetDistance << std::endl; // Log change
+            ImGui::SameLine(); ImGui::Text("Target Beacon ID"); // Label after
+            if (ImGui::InputFloat("##TargetHorizDist", &targetDistance, 0.1f, 1.0f, "%.3f")) {
+                 std::cout << "[GUI Param Update] Target Horiz Distance set to: " << targetDistance << std::endl;
             }
-
-            // Target Azimuth
-            if (ImGui::InputFloat("Target Azimuth (deg)", &targetAzimuth, 1.0f, 10.0f, "%.3f")) {
-                 std::cout << "[GUI Param Update] Target Azimuth set to: " << targetAzimuth << std::endl; // Log change
+             ImGui::SameLine(); ImGui::Text("Target Horiz Dist (m)");
+            if (ImGui::InputFloat("##TargetAzimuth", &targetAzimuth, 1.0f, 10.0f, "%.3f")) {
+                 std::cout << "[GUI Param Update] Target Azimuth set to: " << targetAzimuth << std::endl;
             }
+            ImGui::SameLine(); ImGui::Text("Target Azimuth (deg)");
+            if (ImGui::InputFloat("##RadarMountAngle", &radarMountAngleDegrees, 1.0f, 5.0f, "%.2f")) {
+                 std::cout << "[GUI Param Update] Radar Mount Angle set to: " << radarMountAngleDegrees << std::endl;
+            }
+            ImGui::SameLine(); ImGui::Text("Radar Mount Angle (deg)");
+            ImGui::PopItemWidth();
+            ImGui::EndGroup(); // End Left Group
 
+            ImGui::SameLine(); // Move cursor to the right for the next group
+
+            ImGui::BeginGroup(); // Start Right Group (Yaw Control)
+            ImGui::Text("Yaw Control");
             ImGui::Separator();
-            ImGui::Text("Forward Control:");
-            // Kp Forward
-            if (ImGui::InputFloat("Kp Forward", &Kp_forward, 0.01f, 0.1f, "%.4f")) {
-                 std::cout << "[GUI Param Update] Kp Forward set to: " << Kp_forward << std::endl; // Log change
+            ImGui::PushItemWidth(groupWidth * 0.9f);
+            if (ImGui::InputFloat("##KpYaw", &Kp_yaw, 0.001f, 0.01f, "%.5f")) {
+                 std::cout << "[GUI Param Update] Kp Yaw set to: " << Kp_yaw << std::endl;
             }
-
-            // Max Fwd Speed
-            if (ImGui::InputFloat("Max Fwd Speed (m/s)", &max_forward_speed, 0.05f, 0.2f, "%.3f")) {
-                 std::cout << "[GUI Param Update] Max Fwd Speed set to: " << max_forward_speed << std::endl; // Log change
+            ImGui::SameLine(); ImGui::Text("Kp Yaw");
+            if (ImGui::InputFloat("##MaxYawRate", &max_yaw_rate, 0.5f, 2.0f, "%.2f")) {
+                 std::cout << "[GUI Param Update] Max Yaw Rate set to: " << max_yaw_rate << std::endl;
             }
-
-            // Fwd Dead Zone
-            if (ImGui::InputFloat("Fwd Dead Zone (m)", &forward_dead_zone, 0.01f, 0.1f, "%.3f")) {
-                 std::cout << "[GUI Param Update] Fwd Dead Zone set to: " << forward_dead_zone << std::endl; // Log change
+             ImGui::SameLine(); ImGui::Text("Max Yaw Rate (deg/s)");
+            if (ImGui::InputFloat("##YawBalanceDeadZone", &yaw_azimuth_balance_dead_zone, 0.1f, 0.5f, "%.2f")) {
+                 std::cout << "[GUI Param Update] Yaw Balance Dead Zone set to: " << yaw_azimuth_balance_dead_zone << std::endl;
             }
+             ImGui::SameLine(); ImGui::Text("Yaw Balance Dead Zone (deg)");
+            if (ImGui::Checkbox("##InvertYaw", &invertYawControl)) {
+                 std::cout << "[GUI Param Update] Invert Yaw Control set to: " << std::boolalpha << invertYawControl << std::endl;
+            }
+             ImGui::SameLine(); ImGui::Text("Invert Yaw Control");
+            ImGui::PopItemWidth();
+            ImGui::EndGroup(); // End Right Group
+            ImGui::Separator(); // Separator after the pair
 
+            // --- Pair 2: Forward Control | Lateral Control ---
+            ImGui::BeginGroup(); // Start Left Group (Forward Control)
+            ImGui::Text("Forward Control");
             ImGui::Separator();
-            ImGui::Text("Lateral Control:");
-             // Kp Lateral
-            if (ImGui::InputFloat("Kp Lateral", &Kp_lateral, 0.001f, 0.01f, "%.5f")) {
-                 std::cout << "[GUI Param Update] Kp Lateral set to: " << Kp_lateral << std::endl; // Log change
+            ImGui::PushItemWidth(groupWidth * 0.9f);
+            if (ImGui::InputFloat("##KpForward", &Kp_forward, 0.01f, 0.1f, "%.4f")) {
+                 std::cout << "[GUI Param Update] Kp Forward set to: " << Kp_forward << std::endl;
             }
-
-            // Max Lat Speed
-            if (ImGui::InputFloat("Max Lat Speed (m/s)", &max_lateral_speed, 0.05f, 0.2f, "%.3f")) {
-                 std::cout << "[GUI Param Update] Max Lat Speed set to: " << max_lateral_speed << std::endl; // Log change
+            ImGui::SameLine(); ImGui::Text("Kp Forward");
+            if (ImGui::InputFloat("##MaxFwdSpeed", &max_forward_speed, 0.05f, 0.2f, "%.3f")) {
+                 std::cout << "[GUI Param Update] Max Fwd Speed set to: " << max_forward_speed << std::endl;
             }
-
-            // Azimuth Dead Zone
-            if (ImGui::InputFloat("Azimuth Dead Zone (deg)", &azimuth_dead_zone, 0.1f, 1.0f, "%.3f")) {
-                 std::cout << "[GUI Param Update] Azimuth Dead Zone set to: " << azimuth_dead_zone << std::endl; // Log change
+            ImGui::SameLine(); ImGui::Text("Max Fwd Speed (m/s)");
+            if (ImGui::InputFloat("##FwdDeadZone", &forward_dead_zone, 0.01f, 0.1f, "%.3f")) {
+                 std::cout << "[GUI Param Update] Fwd Dead Zone set to: " << forward_dead_zone << std::endl;
             }
+            ImGui::SameLine(); ImGui::Text("Fwd Dead Zone (m)");
+            ImGui::PopItemWidth();
+            ImGui::EndGroup(); // End Left Group
 
+            ImGui::SameLine(); // Move cursor to the right
+
+            ImGui::BeginGroup(); // Start Right Group (Lateral Control)
+            ImGui::Text("Lateral Control");
             ImGui::Separator();
-            ImGui::Text("Connection:");
-            // Bridge Reconnect
-            if (ImGui::Checkbox("Bridge Reconnect", &enable_bridge_reconnection)) {
-                 std::cout << "[GUI Param Update] Bridge Reconnect set to: " << std::boolalpha << enable_bridge_reconnection << std::endl; // Log change
+            ImGui::PushItemWidth(groupWidth * 0.9f);
+            if (ImGui::InputFloat("##KpLateral", &Kp_lateral, 0.001f, 0.01f, "%.5f")) {
+                 std::cout << "[GUI Param Update] Kp Lateral set to: " << Kp_lateral << std::endl;
+            }
+            ImGui::SameLine(); ImGui::Text("Kp Lateral");
+            if (ImGui::InputFloat("##MaxLatSpeed", &max_lateral_speed, 0.05f, 0.2f, "%.3f")) {
+                 std::cout << "[GUI Param Update] Max Lat Speed set to: " << max_lateral_speed << std::endl;
+            }
+            ImGui::SameLine(); ImGui::Text("Max Lat Speed (m/s)");
+            if (ImGui::InputFloat("##AzimuthDeadZone", &azimuth_dead_zone, 0.1f, 1.0f, "%.3f")) {
+                 std::cout << "[GUI Param Update] Azimuth Dead Zone set to: " << azimuth_dead_zone << std::endl;
+            }
+            ImGui::SameLine(); ImGui::Text("Azimuth Dead Zone (deg)");
+            if (ImGui::Checkbox("##InvertLateral", &invertLateralControl)) {
+                 std::cout << "[GUI Param Update] Invert Lateral Control set to: " << std::boolalpha << invertLateralControl << std::endl;
+            }
+            ImGui::SameLine(); ImGui::Text("Invert Lateral Control");
+            ImGui::PopItemWidth();
+            ImGui::EndGroup(); // End Right Group
+            ImGui::Separator(); // Separator after the pair
+
+            // --- Sensor Control Section (Full Width) ---
+            ImGui::Text("Sensor Control");
+            ImGui::Separator();
+            ImGui::Text("Sensors for Wall Dist:");
+            if (ImGui::Checkbox("Wall R_Az", &useWallSensorRAz)) {
+                 std::cout << "[GUI Param Update] Use Wall R_Az set to: " << std::boolalpha << useWallSensorRAz << std::endl;
+            }
+            ImGui::SameLine();
+            if (ImGui::Checkbox("Wall R_El", &useWallSensorREl)) {
+                 std::cout << "[GUI Param Update] Use Wall R_El set to: " << std::boolalpha << useWallSensorREl << std::endl;
+            }
+            ImGui::SameLine();
+            if (ImGui::Checkbox("Wall R_Az_R_El", &useWallSensorRAzREl)) {
+                 std::cout << "[GUI Param Update] Use Wall R_Az_R_El set to: " << std::boolalpha << useWallSensorRAzREl << std::endl;
             }
 
+            ImGui::Text("Sensors for Beacon Az:");
+            if (ImGui::Checkbox("Beacon R_Az", &useBeaconSensorRAz)) {
+                 std::cout << "[GUI Param Update] Use Beacon R_Az set to: " << std::boolalpha << useBeaconSensorRAz << std::endl;
+            }
+            ImGui::SameLine();
+            if (ImGui::Checkbox("Beacon R_El", &useBeaconSensorREl)) {
+                 std::cout << "[GUI Param Update] Use Beacon R_El set to: " << std::boolalpha << useBeaconSensorREl << std::endl;
+            }
+            ImGui::SameLine();
+            if (ImGui::Checkbox("Beacon R_Az_R_El", &useBeaconSensorRAzREl)) {
+                 std::cout << "[GUI Param Update] Use Beacon R_Az_R_El set to: " << std::boolalpha << useBeaconSensorRAzREl << std::endl;
+            }
+
+            ImGui::Text("Sensors for Yaw Control:");
+            if (ImGui::Checkbox("Yaw R_Az", &useYawSensorRAz)) {
+                 std::cout << "[GUI Param Update] Use Yaw R_Az set to: " << std::boolalpha << useYawSensorRAz << std::endl;
+            }
+            ImGui::SameLine();
+            if (ImGui::Checkbox("Yaw R_El", &useYawSensorREl)) {
+                 std::cout << "[GUI Param Update] Use Yaw R_El set to: " << std::boolalpha << useYawSensorREl << std::endl;
+            }
+            ImGui::SameLine();
+            if (ImGui::Checkbox("Yaw R_Az_R_El", &useYawSensorRAzREl)) {
+                 std::cout << "[GUI Param Update] Use Yaw R_Az_R_El set to: " << std::boolalpha << useYawSensorRAzREl << std::endl;
+            }
+            // No final separator needed here
+
+            ImGui::End(); // End Parameters
+        }
+
+        // 3. Anon Detections Window (Above Beacon Detections)
+        {
+            // Position near bottom-left, leaving space *below* it for the Beacon window
+            ImVec2 window_pos = ImVec2(work_pos.x + padding, work_pos.y + work_size.y - padding - bottom_window_height - ImGui::GetStyle().WindowPadding.y * 2); // Adjusted Y
+            ImVec2 window_pos_pivot = ImVec2(0.0f, 1.0f); // Pivot remains bottom-left of this window
+            ImGui::SetNextWindowPos(window_pos, ImGuiCond_Always, window_pos_pivot);
+            ImGui::SetNextWindowSize(ImVec2(side_window_width, bottom_window_height), ImGuiCond_Always); // Use fixed width & height
+            ImGui::SetNextWindowBgAlpha(0.65f);
+            ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav;
+
+            ImGui::Begin("Anon Detections", nullptr, window_flags);
+            ImGui::Text("Latest Anonymous Objects (ID contains 'anon')");
+            ImGui::Separator();
+            if (ImGui::BeginChild("AnonScrollRegion", ImVec2(0, 0), true)) { // Auto-size child region
+                std::lock_guard<std::mutex> lock(g_anonMutex);
+                if (g_anonObjects.empty()) {
+                    ImGui::TextUnformatted("No anon data received yet or in last frame.");
+                } else {
+                    for (size_t i = 0; i < g_anonObjects.size(); ++i) {
+                        const auto& obj = g_anonObjects[i];
+                        ImGui::Text("Anon #%zu:", i + 1);
+                        ImGui::Indent();
+                        ImGui::Text("TS: %s", obj.timestamp.c_str());
+                        ImGui::Text("Sensor: %s, Src: %s", obj.sensor.c_str(), obj.src.c_str());
+                        ImGui::Text("ID: %s", obj.ID.c_str());
+                        ImGui::Text("Pos (X,Y,Z): %.3f, %.3f, %.3f", obj.X, obj.Y, obj.Z);
+                        ImGui::Text("Dir (X,Y,Z): %.3f, %.3f, %.3f", obj.Xdir, obj.Ydir, obj.Zdir);
+                        ImGui::Text("Range: %.3f, Rate: %.3f, Pwr: %.1f", obj.Range, obj.RangeRate, obj.Pwr);
+                        ImGui::Text("Az: %.2f, El: %.2f, Conf: %.2f", obj.Az, obj.El, obj.Conf);
+                        ImGui::Text("Size (X,Y,Z): %.3f, %.3f, %.3f", obj.Xsize, obj.Ysize, obj.Zsize);
+                        ImGui::Unindent();
+                        ImGui::Separator();
+                    }
+                }
+            }
+            ImGui::EndChild();
             ImGui::End();
         }
 
+        // 4. Beacon Detections Window (Bottom Left)
+        {
+            // Position at the very bottom-left corner
+            ImVec2 window_pos = ImVec2(work_pos.x + padding, work_pos.y + work_size.y - padding);
+            ImVec2 window_pos_pivot = ImVec2(0.0f, 1.0f); // Pivot at bottom-left
+            ImGui::SetNextWindowPos(window_pos, ImGuiCond_Always, window_pos_pivot);
+            ImGui::SetNextWindowSize(ImVec2(side_window_width, bottom_window_height), ImGuiCond_Always); // Use fixed width & height
+            ImGui::SetNextWindowBgAlpha(0.65f);
+            ImGuiWindowFlags window_flags = ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav;
+
+            ImGui::Begin("Beacon Detections", nullptr, window_flags);
+            ImGui::Text("Latest Beacon Objects (ID contains 'BEACON')");
+            ImGui::Separator();
+            if (ImGui::BeginChild("BeaconScrollRegion", ImVec2(0, 0), true)) { // Auto-size child region
+                std::lock_guard<std::mutex> lock(g_beaconMutex);
+                if (g_beaconObjects.empty()) {
+                    ImGui::TextUnformatted("No beacon data received yet or in last frame.");
+                } else {
+                    for (size_t i = 0; i < g_beaconObjects.size(); ++i) {
+                        const auto& obj = g_beaconObjects[i];
+                        ImGui::Text("Beacon #%zu:", i + 1);
+                        ImGui::Indent();
+                        ImGui::Text("TS: %s", obj.timestamp.c_str());
+                        ImGui::Text("Sensor: %s, Src: %s", obj.sensor.c_str(), obj.src.c_str());
+                        ImGui::Text("ID: %s", obj.ID.c_str());
+                        ImGui::Text("Pos (X,Y,Z): %.3f, %.3f, %.3f", obj.X, obj.Y, obj.Z);
+                        ImGui::Text("Dir (X,Y,Z): %.3f, %.3f, %.3f", obj.Xdir, obj.Ydir, obj.Zdir);
+                        ImGui::Text("Range: %.3f, Rate: %.3f, Pwr: %.1f", obj.Range, obj.RangeRate, obj.Pwr);
+                        ImGui::Text("Az: %.2f, El: %.2f, Conf: %.2f", obj.Az, obj.El, obj.Conf);
+                        ImGui::Text("Size (X,Y,Z): %.3f, %.3f, %.3f", obj.Xsize, obj.Ysize, obj.Zsize);
+                        ImGui::Unindent();
+                        ImGui::Separator();
+                    }
+                }
+            }
+            ImGui::EndChild();
+            ImGui::End();
+        }
+
+
         // --- Rendering ---
-        ImGui::Render();
+
+        // --- Draw Status Text directly on Foreground ---
+        if (strlen(statusText) > 0) { // Only draw if there's text
+             ImDrawList* draw_list = ImGui::GetForegroundDrawList();
+             draw_list->AddText(io.Fonts->Fonts[0], // Use default font
+                                scaledFontSize,      // Use the pre-calculated scaled font size
+                                textPos,             // Calculated top-left position
+                                ImGui::ColorConvertFloat4ToU32(statusColor), // Color
+                                statusText);         // The text string
+        }
+        // --- END Draw Status Text ---
+
+        ImGui::Render(); // Render all ImGui windows and draw lists
         int display_w, display_h;
         SDL_GetWindowSize(window, &display_w, &display_h);
         glViewport(0, 0, display_w, display_h);
@@ -1441,12 +2056,12 @@ int main(int argc, char** argv) {
     // ImGui Cleanup
     std::cout << "[GUI] Cleaning up ImGui..." << std::endl;
     ImGui_ImplOpenGL3_Shutdown();
-    ImGui_ImplSDL2_Shutdown(); // CORRECTED FUNCTION CALL
+    ImGui_ImplSDL2_Shutdown(); // Use correct shutdown for SDL backend
     ImGui::DestroyContext();
 
     // SDL Cleanup
     std::cout << "[GUI] Cleaning up SDL..." << std::endl;
-    SDL_GL_DeleteContext(gl_context);
+    SDL_GL_DeleteContext(gl_context); // Corrected variable name
     SDL_DestroyWindow(window);
     SDL_Quit();
 
