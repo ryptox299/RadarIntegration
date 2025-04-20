@@ -11,7 +11,7 @@
 #include <limits> // For numeric limits
 #include <fstream> // For file reading AND LOGGING
 #include <cmath> // For std::abs, std::isnan, std::cos, std::fabs
-#include <atomic> // For thread-safe stop flag
+#include <atomic> // For thread-safe stop flag AND GLOBAL DISPLAY MODE
 #include <cstring> // For strchr, strncpy
 #include <stdexcept> // For standard exceptions
 #include <array> // For std::array used in read_some buffer
@@ -83,6 +83,7 @@ std::vector<RadarObject> g_beaconObjects;
 std::mutex               g_beaconMutex;
 std::vector<RadarObject> g_anonObjects;
 std::mutex               g_anonMutex;
+std::atomic<uint8_t>     g_current_display_mode(255); // Global atomic for display mode (255 = Unknown/Unavailable)
 // --- End Global Data ---
 
 
@@ -1249,14 +1250,15 @@ void processingLoopFunction(const std::string bridgeScriptName, Vehicle* vehicle
 }
 
 
-// Helper function to get mode name string (Keep for monitoring)
+// Helper function to get mode name string (Keep for monitoring and GUI)
 std::string getModeName(uint8_t mode) {
     switch(mode) {
         case DJI::OSDK::VehicleStatus::DisplayMode::MODE_MANUAL_CTRL: return "MANUAL_CTRL";
         case DJI::OSDK::VehicleStatus::DisplayMode::MODE_ATTITUDE: return "ATTITUDE";
         case DJI::OSDK::VehicleStatus::DisplayMode::MODE_P_GPS: return "P_GPS";
-        case DJI::OSDK::VehicleStatus::DisplayMode::MODE_NAVI_SDK_CTRL: return "NAVI_SDK_CTRL";
+        case DJI::OSDK::VehicleStatus::DisplayMode::MODE_NAVI_SDK_CTRL: return "NAVI_SDK_CTRL"; // Value is 17
         case 31: return "Mode 31"; // Example of an unknown/other mode
+        case 255: return "N/A"; // Handle our initial/unavailable state
         default: return "Other (" + std::to_string(mode) + ")";
     }
 }
@@ -1266,6 +1268,7 @@ void monitoringLoopFunction(Vehicle* vehicle) {
     // Ensure vehicle pointer is valid before starting loop
     if (vehicle == nullptr || vehicle->subscribe == nullptr) {
         std::cerr << "[Monitoring] Error: Invalid Vehicle object provided. Thread exiting." << std::endl;
+        g_current_display_mode.store(255); // Set to unavailable on error
         return;
     }
 
@@ -1285,6 +1288,7 @@ void monitoringLoopFunction(Vehicle* vehicle) {
                  std::cerr << "\n**** MONITORING ERROR: Vehicle/subscribe object became null. Stopping. ****" << std::endl << std::endl; // Logged
                  telemetry_timed_out = true;
              }
+             g_current_display_mode.store(255); // Set to unavailable on error
              break; // Exit if vehicle objects become invalid
         }
 
@@ -1293,6 +1297,10 @@ void monitoringLoopFunction(Vehicle* vehicle) {
         uint8_t current_display_mode = vehicle->subscribe->getValue<DJI::OSDK::Telemetry::TOPIC_STATUS_DISPLAYMODE>();
         // float current_height = vehicle->subscribe->getValue<DJI::OSDK::Telemetry::TOPIC_HEIGHT_FUSION>(); // AGL data available if needed
         bool valid_poll = (current_flight_status <= DJI::OSDK::VehicleStatus::FlightStatus::IN_AIR); // Basic validity check
+
+        // --- UPDATE GLOBAL DISPLAY MODE ---
+        g_current_display_mode.store(current_display_mode);
+        // --- END UPDATE ---
 
 
         if (valid_poll) {
@@ -1338,6 +1346,7 @@ void monitoringLoopFunction(Vehicle* vehicle) {
                  std::cerr << "\n**** MONITORING WARNING: Polling telemetry returned potentially invalid data (FlightStatus=" << (int)current_flight_status << "). ****" << std::endl << std::endl; // Logged
                  telemetry_timed_out = true;
             }
+             g_current_display_mode.store(255); // Set to unavailable on invalid poll
         }
 
         // Check Telemetry Timeout
@@ -1347,6 +1356,7 @@ void monitoringLoopFunction(Vehicle* vehicle) {
                 std::cerr << "\n**** MONITORING TIMEOUT: No valid telemetry for over " << TELEMETRY_TIMEOUT_SECONDS << " seconds. ****" << std::endl << std::endl; // Logged
                 telemetry_timed_out = true;
             }
+            g_current_display_mode.store(255); // Set to unavailable on timeout
         } else if (last_valid_poll_time == 0) { // Check if never received first poll
              // Use a static variable to track start time only once
              static time_t start_time = 0; if (start_time == 0) start_time = current_time_for_timeout_check;
@@ -1355,17 +1365,20 @@ void monitoringLoopFunction(Vehicle* vehicle) {
                        std::cerr << "\n**** MONITORING TIMEOUT: Never received valid telemetry poll after " << TELEMETRY_TIMEOUT_SECONDS * 2 << " seconds. ****" << std::endl << std::endl; // Logged
                        telemetry_timed_out = true;
                   }
+                  g_current_display_mode.store(255); // Set to unavailable on initial timeout
              }
         }
 
         std::this_thread::sleep_for(std::chrono::seconds(1)); // Poll frequency
     }
     std::cout << "[Monitoring] Thread finished." << std::endl; // Logged
+    g_current_display_mode.store(255); // Set to unavailable when thread stops
 }
 
 
 // Helper function to stop the processing thread if it's running
-void stopProcessingThreadIfNeeded() {
+// Returns true if a thread was running and was stopped, false otherwise.
+bool stopProcessingThreadIfNeeded() {
     if (processingThread.joinable()) {
         std::cout << "[GUI] Signalling processing thread to stop..." << std::endl; // Logged
         stopProcessingFlag.store(true); // Signal normal stop first
@@ -1376,12 +1389,15 @@ void stopProcessingThreadIfNeeded() {
         forceStopReconnectionFlag.store(false); // Reset flag
         // Status is set to DISCONNECTED inside the thread function upon exit
         // Global data is cleared inside thread function upon exit
+        return true; // Indicate that a thread was stopped
     } else {
+         std::cout << "[GUI] No processing thread currently running." << std::endl; // Logged
          // Ensure status is DISCONNECTED if no thread is running
          currentBridgeStatus.store(BridgeConnectionStatus::DISCONNECTED);
          // Clear global data if no thread was running (e.g., on startup quit)
          { std::lock_guard<std::mutex> lockB(g_beaconMutex); g_beaconObjects.clear(); }
          { std::lock_guard<std::mutex> lockA(g_anonMutex); g_anonObjects.clear(); }
+         return false; // Indicate no thread was running
     }
 }
 
@@ -1399,7 +1415,7 @@ int main(int argc, char** argv) {
 
     // --- OSDK Initialization (Now Conditional) ---
     bool enableFlightControl = false; // Default to false, set true only if connection succeeds
-    int functionTimeout = 1;
+    int functionTimeout = 1; // Default timeout for OSDK calls
     Vehicle* vehicle = nullptr;
     LinuxSetup* linuxEnvironment = nullptr;
     int telemetrySubscriptionFrequency = 10;
@@ -1415,6 +1431,7 @@ int main(int argc, char** argv) {
             std::cerr << "ERROR: Vehicle not initialized or interfaces unavailable. Flight control disabled." << std::endl;
             if (linuxEnvironment) { delete linuxEnvironment; linuxEnvironment = nullptr; }
             vehicle = nullptr;
+            g_current_display_mode.store(255); // Ensure unavailable status if OSDK fails
             // enableFlightControl remains false
         } else {
             std::cout << "[Main] OSDK Vehicle instance OK." << std::endl;
@@ -1426,6 +1443,7 @@ int main(int argc, char** argv) {
             if (ACK::getError(subscribeAck)) {
                  ACK::getErrorCodeMessage(subscribeAck, __func__);
                  std::cerr << "Error verifying subscription package list. Monitoring will be disabled." << std::endl;
+                 g_current_display_mode.store(255); // Ensure unavailable status
             } else {
                  Telemetry::TopicName topicList[] = {
                      Telemetry::TOPIC_STATUS_FLIGHT,
@@ -1441,20 +1459,24 @@ int main(int argc, char** argv) {
                             ACK::getErrorCodeMessage(startAck, "startPackage");
                             std::cerr << "Error starting subscription package " << pkgIndex << ". Monitoring disabled." << std::endl;
                             vehicle->subscribe->removePackage(pkgIndex, functionTimeout);
+                            g_current_display_mode.store(255); // Ensure unavailable status
                        } else {
                             std::cout << "Successfully started telemetry package " << pkgIndex << "." << std::endl;
                             std::cout << "Starting monitoring thread..." << std::endl;
                             stopMonitoringFlag.store(false);
                             monitoringThread = std::thread(monitoringLoopFunction, vehicle);
                             monitoringEnabled = true;
+                            // g_current_display_mode will be updated by the thread
                        }
                  } else {
                       std::cerr << "Error initializing telemetry package " << pkgIndex << ". Monitoring disabled." << std::endl;
+                      g_current_display_mode.store(255); // Ensure unavailable status
                  }
             }
         }
     } else {
         std::cout << "[Main] Skipping OSDK Initialization (connect_to_drone is false). Flight control disabled." << std::endl;
+        g_current_display_mode.store(255); // Ensure unavailable status
         // vehicle remains nullptr, enableFlightControl remains false
     }
 
@@ -1565,6 +1587,13 @@ int main(int argc, char** argv) {
     const float side_window_width = 400.0f;    // Define width for side windows (Menu, Detections)
     const float bottom_window_height = 240.0f; // Define height for bottom windows
 
+    // --- Color Constants ---
+    const ImVec4 COLOR_GREEN = ImVec4(0.0f, 1.0f, 0.0f, 1.0f);
+    const ImVec4 COLOR_RED = ImVec4(1.0f, 0.0f, 0.0f, 1.0f);
+    const ImVec4 COLOR_ORANGE = ImVec4(1.0f, 0.65f, 0.0f, 1.0f);
+    const ImVec4 COLOR_GREY = ImVec4(0.7f, 0.7f, 0.7f, 1.0f); // For N/A status
+
+
     std::cout << "[GUI] Entering main GUI loop..." << std::endl;
     // --- Main GUI Loop ---
     while (guiKeepRunning) {
@@ -1589,54 +1618,50 @@ int main(int argc, char** argv) {
         ImVec2 work_pos = viewport->WorkPos; // Top-left of usable area
         ImVec2 work_size = viewport->WorkSize; // Size of usable area
 
-        // --- Status Text Variables (Used Later for Drawing) ---
-        const char* statusText = "";
-        ImVec4 statusColor = ImVec4(1.0f, 0.0f, 0.0f, 1.0f); // Default Red
-        const float desiredScale = 2.0f;
-        ImVec2 textPos = ImVec2(0,0);
-        float scaledFontSize = io.Fonts->Fonts[0]->FontSize * desiredScale; // Calculate scaled font size
+        // --- Status Text Variables (Used for the new status window) ---
+        const char* radarStatusText = "";
+        ImVec4 radarStatusColor = COLOR_RED; // Default Red
 
-        // --- Determine Status Text and Color ---
+        // --- Determine Radar Status Text and Color ---
         {
-            const ImVec4 green = ImVec4(0.0f, 1.0f, 0.0f, 1.0f);
-            const ImVec4 red = ImVec4(1.0f, 0.0f, 0.0f, 1.0f);
-            const ImVec4 orange = ImVec4(1.0f, 0.65f, 0.0f, 1.0f);
             BridgeConnectionStatus status = currentBridgeStatus.load();
-
             switch(status) {
                 case BridgeConnectionStatus::CONNECTED:
-                    statusText = "Radar: Connected";
-                    statusColor = green;
+                    radarStatusText = "Radar: Connected";
+                    radarStatusColor = COLOR_GREEN;
                     break;
                 case BridgeConnectionStatus::DISCONNECTED:
-                    statusText = "Radar: Disconnected";
-                    statusColor = red;
+                    radarStatusText = "Radar: Disconnected";
+                    radarStatusColor = COLOR_RED;
                     break;
                 case BridgeConnectionStatus::RECONNECTING:
-                    statusText = "Radar: Attempting Reconnect...";
-                    statusColor = orange;
+                    radarStatusText = "Radar: Attempting Reconnect...";
+                    radarStatusColor = COLOR_ORANGE;
                     break;
             }
-
-            // --- Calculate Text Size (using the specific scaled font size) and Position ---
-            // Temporarily push font scale *only* for size calculation if AddText doesn't handle it well
-            // ImGui::PushFont(io.Fonts->Fonts[0]); // Select font
-            // ImGui::SetWindowFontScale(desiredScale); // Set scale for calculation
-            // ImVec2 scaledTextSize = ImGui::CalcTextSize(statusText);
-            // ImGui::SetWindowFontScale(1.0f); // Reset scale
-            // ImGui::PopFont();
-            // --- OR --- Calculate size with base font and scale manually (Try this first)
-            ImVec2 baseTextSize = ImGui::CalcTextSize(statusText);
-            float scaledTextWidth = baseTextSize.x * desiredScale;
-
-
-            float verticalPadding = 10.0f;
-            float mainMenuRightEdgeX = work_pos.x + padding + side_window_width;
-            float textPosX = mainMenuRightEdgeX - scaledTextWidth; // Align right edge by subtracting scaled width
-            float textPosY = work_pos.y + verticalPadding;
-            textPos = ImVec2(std::max(work_pos.x, textPosX), std::max(work_pos.y, textPosY)); // Ensure it's on screen
         }
-        // --- END Status Text Determination ---
+        // --- END Radar Status Text Determination ---
+
+        // --- Drone Mode Status Variables ---
+        std::string droneModeText = "Mode: N/A";
+        ImVec4 droneModeColor = COLOR_GREY;
+        // --- Determine Drone Mode Text and Color ---
+        {
+            uint8_t mode_val = g_current_display_mode.load();
+            if (connect_to_drone && vehicle != nullptr) { // Only show real mode if drone connection was attempted and successful
+                 droneModeText = "Mode: " + getModeName(mode_val);
+                 if (mode_val == DJI::OSDK::VehicleStatus::DisplayMode::MODE_NAVI_SDK_CTRL) { // Check for SDK control mode (value 17)
+                     droneModeColor = COLOR_GREEN;
+                 } else if (mode_val == 255) { // Unknown/Unavailable
+                      droneModeColor = COLOR_GREY;
+                 } else { // Any other mode
+                     droneModeColor = COLOR_RED;
+                 }
+            } else {
+                // Keep default "Mode: N/A" and grey color if not connected to drone
+            }
+        }
+        // --- END Drone Mode Status Determination ---
 
 
         // --- REMOVED StatusIndicator Window Block ---
@@ -1655,11 +1680,57 @@ int main(int argc, char** argv) {
 
             ImGui::Begin("Main Menu", nullptr, window_flags);
 
+            // --- Takeoff and Hover Button ---
+            if (!enableFlightControl) ImGui::BeginDisabled();
+            if (ImGui::Button("Takeoff and Hover (1m)")) {
+                std::cout << "[GUI] 'Takeoff and Hover' button clicked." << std::endl;
+                stopProcessingThreadIfNeeded(); // Stop any other action first
+                forceStopReconnectionFlag.store(false); // Ensure reconnect doesn't interfere
+
+                if (enableFlightControl && vehicle != nullptr && vehicle->control != nullptr) {
+                    std::cout << "[GUI] Attempting to obtain Control Authority for Takeoff..." << std::endl;
+                    ACK::ErrorCode ctrlAuthAck = vehicle->control->obtainCtrlAuthority(functionTimeout);
+                    if (ACK::getError(ctrlAuthAck)) {
+                        ACK::getErrorCodeMessage(ctrlAuthAck, "[GUI] Takeoff obtainCtrlAuthority");
+                        std::cerr << "[GUI] Failed to obtain control authority. Cannot takeoff." << std::endl;
+                    } else {
+                        std::cout << "[GUI] Obtained Control Authority. Executing Takeoff..." << std::endl;
+                        ACK::ErrorCode takeoffAck = vehicle->control->takeoff(functionTimeout);
+                        if (ACK::getError(takeoffAck)) {
+                             ACK::getErrorCodeMessage(takeoffAck, "[GUI] Takeoff command failed");
+                             std::cerr << "[GUI] Takeoff command failed. Releasing control." << std::endl;
+                             // Attempt to release control even if takeoff failed
+                             ACK::ErrorCode releaseAck = vehicle->control->releaseCtrlAuthority(functionTimeout);
+                             if (ACK::getError(releaseAck)) ACK::getErrorCodeMessage(releaseAck, "[GUI] releaseCtrlAuthority after failed takeoff");
+                        } else {
+                             std::cout << "[GUI] Takeoff command sent successfully. Waiting a few seconds..." << std::endl;
+                             // Wait for a bit after sending takeoff before commanding hover
+                             std::this_thread::sleep_for(std::chrono::seconds(8)); // Adjust delay as needed
+
+                             std::cout << "[GUI] Commanding Hover (Zero Velocity)..." << std::endl;
+                             DJI::OSDK::Control::CtrlData hoverData(DJI::OSDK::Control::HORIZONTAL_VELOCITY | DJI::OSDK::Control::VERTICAL_VELOCITY | DJI::OSDK::Control::YAW_RATE | DJI::OSDK::Control::HORIZONTAL_BODY | DJI::OSDK::Control::STABLE_ENABLE, 0, 0, 0, 0);
+                             vehicle->control->flightCtrl(hoverData); // Send hover command (non-blocking)
+                             std::cout << "[GUI] Hover command sent." << std::endl;
+
+                             // Release control after commanding hover so drone maintains state
+                             std::cout << "[GUI] Releasing control authority after commanding hover..." << std::endl;
+                             ACK::ErrorCode releaseAck = vehicle->control->releaseCtrlAuthority(functionTimeout);
+                             if (ACK::getError(releaseAck)) ACK::getErrorCodeMessage(releaseAck, "[GUI] releaseCtrlAuthority after hover");
+                             else std::cout << "[GUI] Control authority released after hover." << std::endl;
+                        }
+                    }
+                } else {
+                     std::cerr << "[GUI] Cannot Takeoff: Flight control disabled or OSDK not ready." << std::endl;
+                }
+            }
+            if (!enableFlightControl) ImGui::EndDisabled();
+            ImGui::Separator(); // Separator after basic flight commands
+
             // --- Wall+Beacon Following Button ---
             if (!enableFlightControl) ImGui::BeginDisabled();
             if (ImGui::Button("Start Wall+Beacon Following [w]")) {
                 std::cout << "[GUI] 'w' button clicked." << std::endl;
-                stopProcessingThreadIfNeeded();
+                stopProcessingThreadIfNeeded(); // Stop previous thread if running
                 forceStopReconnectionFlag.store(false);
                 if (enableFlightControl && vehicle != nullptr && vehicle->control != nullptr) {
                     std::cout << "[GUI] Attempting to obtain Control Authority for Wall Following..." << std::endl;
@@ -1670,7 +1741,7 @@ int main(int argc, char** argv) {
                         currentBridgeStatus.store(BridgeConnectionStatus::DISCONNECTED);
                     } else {
                         std::cout << "[GUI] Obtained Control Authority for Wall Following." << std::endl;
-                        stopProcessingFlag.store(false);
+                        stopProcessingFlag.store(false); // Ensure stop flag is false before starting
                         processingThread = std::thread(processingLoopFunction, defaultPythonBridgeScript, vehicle, true, ProcessingMode::WALL_FOLLOW);
                     }
                 } else {
@@ -1684,7 +1755,7 @@ int main(int argc, char** argv) {
             if (!enableFlightControl) ImGui::BeginDisabled();
             if (ImGui::Button("Start Wall+Beacon Following + Yaw Control")) {
                 std::cout << "[GUI] 'Wall+Beacon+Yaw' button clicked." << std::endl;
-                stopProcessingThreadIfNeeded();
+                stopProcessingThreadIfNeeded(); // Stop previous thread if running
                 forceStopReconnectionFlag.store(false);
                 if (enableFlightControl && vehicle != nullptr && vehicle->control != nullptr) {
                     std::cout << "[GUI] Attempting to obtain Control Authority for Wall+Beacon+Yaw..." << std::endl;
@@ -1695,7 +1766,7 @@ int main(int argc, char** argv) {
                         currentBridgeStatus.store(BridgeConnectionStatus::DISCONNECTED);
                     } else {
                         std::cout << "[GUI] Obtained Control Authority for Wall+Beacon+Yaw." << std::endl;
-                        stopProcessingFlag.store(false);
+                        stopProcessingFlag.store(false); // Ensure stop flag is false before starting
                         // Start the thread with the NEW mode and NEW function
                         processingThread = std::thread(processingLoopFunction, defaultPythonBridgeScript, vehicle, true, ProcessingMode::WALL_BEACON_YAW);
                     }
@@ -1706,34 +1777,81 @@ int main(int argc, char** argv) {
             }
              if (!enableFlightControl) {
                 ImGui::EndDisabled();
-                ImGui::SameLine();
-                ImGui::TextDisabled("(Flight Control Disabled)");
+                // Remove SameLine and TextDisabled if only one button is disabled
+                // ImGui::SameLine();
+                // ImGui::TextDisabled("(Flight Control Disabled)");
             }
 
 
             // --- Process Full Radar Button ---
             if (ImGui::Button("Process Full Radar [e]")) {
                  std::cout << "[GUI] 'e' button clicked." << std::endl;
-                 stopProcessingThreadIfNeeded();
+                 stopProcessingThreadIfNeeded(); // Stop previous thread if running
                  forceStopReconnectionFlag.store(false);
                  std::cout << "[GUI] Starting Radar Data processing (Full, No Control)..." << std::endl;
-                 stopProcessingFlag.store(false);
+                 stopProcessingFlag.store(false); // Ensure stop flag is false before starting
                  processingThread = std::thread(processingLoopFunction, defaultPythonBridgeScript, nullptr, false, ProcessingMode::PROCESS_FULL);
             }
 
+            ImGui::Separator(); // Add separator before stop buttons
+
             // --- Stop Reconnect Button ---
             if (enable_bridge_reconnection) {
+                // Only enable if a thread is running AND it's in the RECONNECTING state
                 bool should_enable_stop_reconnect = processingThread.joinable() && (currentBridgeStatus.load() == BridgeConnectionStatus::RECONNECTING);
                 if (!should_enable_stop_reconnect) ImGui::BeginDisabled();
                 if (ImGui::Button("Stop Reconnection Attempt")) {
                     std::cout << "[GUI] 'Stop Reconnection Attempt' button clicked." << std::endl;
-                    forceStopReconnectionFlag.store(true);
+                    forceStopReconnectionFlag.store(true); // Signal the reconnect loop to stop trying
                 }
                 if (!should_enable_stop_reconnect) ImGui::EndDisabled();
+                ImGui::SameLine(); // Keep Stop button on the same line if possible
             }
+
+            // --- General Stop Button ---
+            // Only enable if a processing thread is currently running (regardless of state)
+            bool is_processing_thread_running = processingThread.joinable();
+            if (!is_processing_thread_running) ImGui::BeginDisabled();
+            if (ImGui::Button("Stop Current Action")) {
+                std::cout << "[GUI] 'Stop Current Action' button clicked." << std::endl;
+                stopProcessingThreadIfNeeded(); // Call the function to stop the thread and handle cleanup
+            }
+            if (!is_processing_thread_running) ImGui::EndDisabled();
+
 
             ImGui::End(); // End Main Menu
         }
+
+        // --- NEW: Combined Status Window (Right of Main Menu) ---
+        {
+            // Calculate position: Top-left X is Main Menu's X + Width + Padding. Top-left Y is Main Menu's Y.
+            ImVec2 status_window_pos = ImVec2(work_pos.x + padding + side_window_width + padding, work_pos.y + padding);
+            ImVec2 window_pos_pivot = ImVec2(0.0f, 0.0f); // Pivot at top-left
+
+            ImGui::SetNextWindowPos(status_window_pos, ImGuiCond_Always, window_pos_pivot); // Pin to the calculated position
+            ImGui::SetNextWindowSize(ImVec2(0, 0)); // Auto-resize based on content
+            ImGui::SetNextWindowBgAlpha(0.65f); // Match other windows' transparency
+
+            // Flags for a simple status display: No title, no moving/resizing, auto-fit content
+            ImGuiWindowFlags status_window_flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                                                   ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize |
+                                                   ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav;
+
+            ImGui::Begin("CombinedStatusWindow", nullptr, status_window_flags); // Use a unique name
+
+            // Display Radar Status
+            if (strlen(radarStatusText) > 0) { // Only display if there's text
+                ImGui::TextColored(radarStatusColor, "%s", radarStatusText);
+            } else {
+                ImGui::Text("Radar Status Unknown"); // Fallback
+            }
+
+            // Display Drone Mode Status (on the next line)
+            ImGui::TextColored(droneModeColor, "%s", droneModeText.c_str());
+
+            ImGui::End();
+        }
+        // --- END NEW Combined Status Window ---
 
 
         // 2. Parameters Window (Top Right - Layout using Groups and SameLine)
@@ -1989,16 +2107,7 @@ int main(int argc, char** argv) {
 
         // --- Rendering ---
 
-        // --- Draw Status Text directly on Foreground ---
-        if (strlen(statusText) > 0) { // Only draw if there's text
-             ImDrawList* draw_list = ImGui::GetForegroundDrawList();
-             draw_list->AddText(io.Fonts->Fonts[0], // Use default font
-                                scaledFontSize,      // Use the pre-calculated scaled font size
-                                textPos,             // Calculated top-left position
-                                ImGui::ColorConvertFloat4ToU32(statusColor), // Color
-                                statusText);         // The text string
-        }
-        // --- END Draw Status Text ---
+        // --- REMOVED direct drawing of status text to foreground ---
 
         ImGui::Render(); // Render all ImGui windows and draw lists
         int display_w, display_h;
