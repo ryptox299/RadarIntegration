@@ -1377,8 +1377,7 @@ void monitoringLoopFunction(Vehicle* vehicle) {
 
 
 // Helper function to stop the processing thread if it's running
-// Returns true if a thread was running and was stopped, false otherwise.
-bool stopProcessingThreadIfNeeded() {
+void stopProcessingThreadIfNeeded() {
     if (processingThread.joinable()) {
         std::cout << "[GUI] Signalling processing thread to stop..." << std::endl; // Logged
         stopProcessingFlag.store(true); // Signal normal stop first
@@ -1389,7 +1388,6 @@ bool stopProcessingThreadIfNeeded() {
         forceStopReconnectionFlag.store(false); // Reset flag
         // Status is set to DISCONNECTED inside the thread function upon exit
         // Global data is cleared inside thread function upon exit
-        return true; // Indicate that a thread was stopped
     } else {
          std::cout << "[GUI] No processing thread currently running." << std::endl; // Logged
          // Ensure status is DISCONNECTED if no thread is running
@@ -1397,7 +1395,6 @@ bool stopProcessingThreadIfNeeded() {
          // Clear global data if no thread was running (e.g., on startup quit)
          { std::lock_guard<std::mutex> lockB(g_beaconMutex); g_beaconObjects.clear(); }
          { std::lock_guard<std::mutex> lockA(g_anonMutex); g_anonObjects.clear(); }
-         return false; // Indicate no thread was running
     }
 }
 
@@ -1415,7 +1412,7 @@ int main(int argc, char** argv) {
 
     // --- OSDK Initialization (Now Conditional) ---
     bool enableFlightControl = false; // Default to false, set true only if connection succeeds
-    int functionTimeout = 1; // Default timeout for OSDK calls
+    int functionTimeout = 1;
     Vehicle* vehicle = nullptr;
     LinuxSetup* linuxEnvironment = nullptr;
     int telemetrySubscriptionFrequency = 10;
@@ -1680,52 +1677,6 @@ int main(int argc, char** argv) {
 
             ImGui::Begin("Main Menu", nullptr, window_flags);
 
-            // --- Takeoff and Hover Button ---
-            if (!enableFlightControl) ImGui::BeginDisabled();
-            if (ImGui::Button("Takeoff and Hover (1m)")) {
-                std::cout << "[GUI] 'Takeoff and Hover' button clicked." << std::endl;
-                stopProcessingThreadIfNeeded(); // Stop any other action first
-                forceStopReconnectionFlag.store(false); // Ensure reconnect doesn't interfere
-
-                if (enableFlightControl && vehicle != nullptr && vehicle->control != nullptr) {
-                    std::cout << "[GUI] Attempting to obtain Control Authority for Takeoff..." << std::endl;
-                    ACK::ErrorCode ctrlAuthAck = vehicle->control->obtainCtrlAuthority(functionTimeout);
-                    if (ACK::getError(ctrlAuthAck)) {
-                        ACK::getErrorCodeMessage(ctrlAuthAck, "[GUI] Takeoff obtainCtrlAuthority");
-                        std::cerr << "[GUI] Failed to obtain control authority. Cannot takeoff." << std::endl;
-                    } else {
-                        std::cout << "[GUI] Obtained Control Authority. Executing Takeoff..." << std::endl;
-                        ACK::ErrorCode takeoffAck = vehicle->control->takeoff(functionTimeout);
-                        if (ACK::getError(takeoffAck)) {
-                             ACK::getErrorCodeMessage(takeoffAck, "[GUI] Takeoff command failed");
-                             std::cerr << "[GUI] Takeoff command failed. Releasing control." << std::endl;
-                             // Attempt to release control even if takeoff failed
-                             ACK::ErrorCode releaseAck = vehicle->control->releaseCtrlAuthority(functionTimeout);
-                             if (ACK::getError(releaseAck)) ACK::getErrorCodeMessage(releaseAck, "[GUI] releaseCtrlAuthority after failed takeoff");
-                        } else {
-                             std::cout << "[GUI] Takeoff command sent successfully. Waiting a few seconds..." << std::endl;
-                             // Wait for a bit after sending takeoff before commanding hover
-                             std::this_thread::sleep_for(std::chrono::seconds(8)); // Adjust delay as needed
-
-                             std::cout << "[GUI] Commanding Hover (Zero Velocity)..." << std::endl;
-                             DJI::OSDK::Control::CtrlData hoverData(DJI::OSDK::Control::HORIZONTAL_VELOCITY | DJI::OSDK::Control::VERTICAL_VELOCITY | DJI::OSDK::Control::YAW_RATE | DJI::OSDK::Control::HORIZONTAL_BODY | DJI::OSDK::Control::STABLE_ENABLE, 0, 0, 0, 0);
-                             vehicle->control->flightCtrl(hoverData); // Send hover command (non-blocking)
-                             std::cout << "[GUI] Hover command sent." << std::endl;
-
-                             // Release control after commanding hover so drone maintains state
-                             std::cout << "[GUI] Releasing control authority after commanding hover..." << std::endl;
-                             ACK::ErrorCode releaseAck = vehicle->control->releaseCtrlAuthority(functionTimeout);
-                             if (ACK::getError(releaseAck)) ACK::getErrorCodeMessage(releaseAck, "[GUI] releaseCtrlAuthority after hover");
-                             else std::cout << "[GUI] Control authority released after hover." << std::endl;
-                        }
-                    }
-                } else {
-                     std::cerr << "[GUI] Cannot Takeoff: Flight control disabled or OSDK not ready." << std::endl;
-                }
-            }
-            if (!enableFlightControl) ImGui::EndDisabled();
-            ImGui::Separator(); // Separator after basic flight commands
-
             // --- Wall+Beacon Following Button ---
             if (!enableFlightControl) ImGui::BeginDisabled();
             if (ImGui::Button("Start Wall+Beacon Following [w]")) {
@@ -1777,9 +1728,8 @@ int main(int argc, char** argv) {
             }
              if (!enableFlightControl) {
                 ImGui::EndDisabled();
-                // Remove SameLine and TextDisabled if only one button is disabled
-                // ImGui::SameLine();
-                // ImGui::TextDisabled("(Flight Control Disabled)");
+                ImGui::SameLine();
+                ImGui::TextDisabled("(Flight Control Disabled)");
             }
 
 
